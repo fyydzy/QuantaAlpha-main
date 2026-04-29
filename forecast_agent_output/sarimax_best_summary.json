@@ -1,0 +1,49 @@
+{
+  "backend": "sarimax",
+  "task": {
+    "source": "gas_monthly",
+    "excel_path": "data\\processed_data\\河北.xlsx",
+    "as_of_month": "2025-06",
+    "test_start": "2025-11",
+    "test_end": "2026-03",
+    "province": null,
+    "horizon": 9,
+    "selection_metric": "mape",
+    "exog_cols": [
+      "avg_temp",
+      "max_temp",
+      "min_temp",
+      "HDD",
+      "temp_range"
+    ]
+  },
+  "best_params": {
+    "context_len": 84
+  },
+  "best_feedback": {
+    "score": 2.858127298862458,
+    "smape": 2.5297275508932793,
+    "mape": 2.6492308831011604,
+    "rmse": 6405.437098927948,
+    "mae": 3586.303031013842,
+    "bias": 3586.303031013842,
+    "aic": 1800.6705448638972,
+    "success": true,
+    "message": "预测存在系统性偏差",
+    "metrics": {
+      "score": 2.858127298862458,
+      "smape": 2.5297275508932793,
+      "mape": 2.6492308831011604,
+      "rmse": 6405.437098927948,
+      "mae": 3586.303031013842,
+      "bias": 3586.303031013842
+    }
+  },
+  "trace_size": 18,
+  "test_metrics": {
+    "MAE": 3586.303031013842,
+    "RMSE": 6405.437098927948,
+    "MAPE(%)": 2.6492308831011604
+  },
+  "test_xlsx": "forecast_agent_output\\sarimax_test.xlsx"
+}
