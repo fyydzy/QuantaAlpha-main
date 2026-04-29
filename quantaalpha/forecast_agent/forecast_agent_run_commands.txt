@@ -1,0 +1,61 @@
+# Forecast Agent 常用运行命令（PowerShell）
+# 说明：
+# 当前项目若不是完整 git 仓库，uv run 触发 editable 构建时可能因 setuptools-scm 报错；
+# 每次新开终端运行前可先设置下面的环境变量。
+
+cd "E:\4.1\internship2\智能体框架\QuantaAlpha-main"
+
+$env:SETUPTOOLS_SCM_PRETEND_VERSION_FOR_QUANTAALPHA = "0.1.0"
+
+# 可选：确认 timesfm 已安装
+# uv pip install timesfm
+
+# ---- 显式指定 Excel 路径 ----
+uv run python -m quantaalpha.forecast_agent.cli --model sarimax --excel "data/processed_data/河北.xlsx" --as-of-month 2025-06 --test-start 2025-11 --test-end 2026-03 --timesfm-device cpu --selection-metric mape --output-dir "forecast_agent_output/河北_timesfm"
+
+# ---- 按省份自动查找 Excel ----
+uv run python -m quantaalpha.forecast_agent.cli --model timesfm --province 河北 --as-of-month 2025-06 --test-start 2025-11 --test-end 2026-03 --timesfm-device cpu --selection-metric mape --output-dir "forecast_agent_output/河北_timesfm"
+
+# ---- 按复合 score 选参 ----
+uv run python -m quantaalpha.forecast_agent.cli --model timesfm --province 河北 --as-of-month 2025-06 --test-start 2025-11 --test-end 2026-03 --timesfm-device cpu --selection-metric score --output-dir "forecast_agent_output/河北_timesfm_score"
+
+# ---- SARIMAX（使用天气外生变量，按测试集 MAPE 选 context_len）----
+uv run python -m quantaalpha.forecast_agent.cli --model sarimax --province 河北 --as-of-month 2025-06 --test-start 2025-11 --test-end 2026-03 --selection-metric mape --output-dir "forecast_agent_output/河北_sarimax"
+
+# =============================================================================
+# 参数说明
+# =============================================================================
+#
+# --excel
+#   Excel 文件路径；与 --province 二选一。
+#
+# --model
+#   选择模型后端。当前支持 timesfm / sarimax，后续新增 agent 时继续在 CLI 中扩展。
+#
+# --province
+#   按省份名自动拼路径：data/processed_data/{省份}.xlsx
+#
+# --as-of-month
+#   训练数据截止月（YYYY-MM）；缺省则用 data 模块常量 AS_OF_MONTH。
+#
+# --test-start / --test-end
+#   测试区间（YYYY-MM）。程序会预测 as_of 后到 test_end 的所有月份；
+#   as_of 与 test_start 之间的月份是 bridge，只输出预测，不参与选参指标；
+#   test_start 到 test_end 的月份用真实值计算指标，并直接用于选择最优 context_len。
+#
+# --timesfm-device
+#   TimesFM 推理设备：cpu 或 gpu；--model sarimax 时忽略。
+#
+# --selection-metric
+#   选参依据：mape 或 score（0.7*SMAPE + 0.3*RMSE 项）。
+#
+# --output-dir
+#   结果输出目录（摘要 JSON、轨迹 CSV、预测图、测试表等）。
+#
+# ---- TimesFM 与 freq（代码行为，无独立命令行开关）----
+# TimesFM 调用里 freq 固定为 2；normalize/log_transform 固定为 False；
+# 自动搜索仅在 context_len 上做网格枚举。
+#
+# ---- SARIMAX 与外生变量（代码行为，无独立命令行开关）----
+# SARIMAX 使用 avg_temp/max_temp/min_temp 以及派生的 HDD/temp_range 作为外生变量；
+# 输入 Excel 必须包含 month/gas_sales/avg_temp/max_temp/min_temp。
