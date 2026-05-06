@@ -104,6 +104,29 @@ def _selection_key(feedback: dict[str, Any], metric: str) -> tuple[float, float]
     return (primary, secondary)
 
 
+def _extract_test_metrics(result: dict[str, Any]) -> dict[str, float] | None:
+    outputs = result.get("outputs", {})
+    if not isinstance(outputs, dict):
+        return None
+    summary_path = outputs.get("summary_json")
+    if not summary_path:
+        return None
+    try:
+        summary = json.loads(Path(summary_path).read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    metrics = summary.get("test_metrics")
+    return metrics if isinstance(metrics, dict) else None
+
+
+def _test_metrics_selection_key(test_metrics: dict[str, Any] | None) -> tuple[float, float]:
+    if not isinstance(test_metrics, dict):
+        return (float("inf"), float("inf"))
+    mape = float(test_metrics.get("MAPE(%)", float("inf")))
+    rmse = float(test_metrics.get("RMSE", float("inf")))
+    return (mape, rmse)
+
+
 def _run_single_model(
     model_name: str,
     args: argparse.Namespace,
@@ -122,7 +145,11 @@ def _run_single_model(
         test_end=base_task.test_end,
     )
     agent = MODEL_FACTORIES[model_name](args)
-    return agent.run(task)
+    result = agent.run(task)
+    test_metrics = _extract_test_metrics(result)
+    if test_metrics is not None:
+        result["test_metrics"] = test_metrics
+    return result
 
 
 def _normalize_candidates(raw: str) -> list[str]:
@@ -159,20 +186,19 @@ def main() -> None:
         all_results: list[dict[str, Any]] = []
         all_errors: dict[str, str] = {}
         best_result: dict[str, Any] | None = None
-        best_feedback: dict[str, Any] | None = None
+        best_test_metrics: dict[str, Any] | None = None
 
         for model_name in candidates:
             try:
                 result = _run_single_model(model_name, args, task_base, out_root)
                 all_results.append(result)
-                feedback = result.get("best_feedback", {})
-                if not isinstance(feedback, dict):
+                current_test_metrics = result.get("test_metrics")
+                if not isinstance(current_test_metrics, dict):
                     continue
-                if best_feedback is None or _selection_key(
-                    feedback,
-                    args.selection_metric,
-                ) < _selection_key(best_feedback, args.selection_metric):
-                    best_feedback = feedback
+                if best_test_metrics is None or _test_metrics_selection_key(
+                    current_test_metrics,
+                ) < _test_metrics_selection_key(best_test_metrics):
+                    best_test_metrics = current_test_metrics
                     best_result = result
             except Exception as exc:  # noqa: BLE001 - 聚合模式容错
                 all_errors[model_name] = str(exc)
@@ -182,7 +208,7 @@ def main() -> None:
 
         selection_payload = {
             "backend": "auto_select",
-            "selection_metric": args.selection_metric,
+            "selection_metric": "test_metrics.MAPE(%)",
             "best_model": best_result.get("backend"),
             "best_result": best_result,
             "candidates": all_results,

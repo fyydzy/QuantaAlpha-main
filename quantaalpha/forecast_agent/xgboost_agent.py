@@ -114,13 +114,13 @@ def _apply_context_window(df: pd.DataFrame, context_len: int) -> pd.DataFrame:
 def _prepare_train_and_future(
     ctx: TaskContext,
     params: XgboostHyperParams,
-) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+) -> tuple[pd.DataFrame, pd.DataFrame, list[str], dict[str, Any]]:
     path = str(ctx.metadata["excel_path"])
     as_of = str(ctx.metadata["as_of_month"])
     feature_df = _load_feature_frame(path)
 
-    train_df = feature_df[feature_df[MONTH_COL] <= as_of].sort_values(MONTH_COL)
-    train_df = _apply_context_window(train_df, params.context_len)
+    train_df_full = feature_df[feature_df[MONTH_COL] <= as_of].sort_values(MONTH_COL)
+    train_df = _apply_context_window(train_df_full, params.context_len)
     if len(train_df) < 24:
         raise ValueError(f"context={params.context_len} 样本仅 {len(train_df)} 月，少于 24 月")
 
@@ -130,7 +130,14 @@ def _prepare_train_and_future(
         raise ValueError(f"XGBoost 特征月份不完整，缺少: {missing}")
 
     feature_cols = [c for c in feature_df.columns if c not in {MONTH_COL, TARGET_COL}]
-    return train_df, future_df, feature_cols
+    data_debug = {
+        "feature_rows_total": int(len(feature_df)),
+        "train_rows_before_context": int(len(train_df_full)),
+        "train_rows_after_context": int(len(train_df)),
+        "context_len": int(params.context_len),
+        "context_applied": bool(len(train_df_full) != len(train_df)),
+    }
+    return train_df, future_df, feature_cols, data_debug
 
 
 def _split_train_val(
@@ -149,7 +156,7 @@ def _fit_with_early_stopping(
     X_train_full: np.ndarray,
     y_train_full: np.ndarray,
     params: XgboostHyperParams,
-) -> tuple[Any, int, dict[str, float]]:
+) -> tuple[Any, int, dict[str, float], dict[str, int]]:
     from xgboost import XGBRegressor  # type: ignore[import-not-found]
 
     X_train, y_train, X_val, y_val = _split_train_val(X_train_full, y_train_full)
@@ -172,7 +179,11 @@ def _fit_with_early_stopping(
     best_iteration = int(getattr(model, "best_iteration", 799))
     if best_iteration < 0:
         best_iteration = 799
-    return model, best_iteration, val_metrics
+    split_debug = {
+        "fit_train_rows": int(len(X_train)),
+        "fit_val_rows": int(len(X_val)),
+    }
+    return model, best_iteration, val_metrics, split_debug
 
 
 def _refit_full_train(
@@ -204,11 +215,11 @@ class XgboostEvaluator(ForecastEvaluator):
         ctx = load_task_context(task)
         params: XgboostHyperParams = subjects.params  # type: ignore[assignment]
         try:
-            train_df, _, feature_cols = _prepare_train_and_future(ctx, params)
+            train_df, _, feature_cols, data_debug = _prepare_train_and_future(ctx, params)
             X_train = train_df[feature_cols].to_numpy(dtype=float)
             y_train = train_df[TARGET_COL].to_numpy(dtype=float)
 
-            _, best_iteration, val_metrics = _fit_with_early_stopping(X_train, y_train, params)
+            _, best_iteration, val_metrics, split_debug = _fit_with_early_stopping(X_train, y_train, params)
             return ForecastFeedback(
                 score=val_metrics["score"],
                 smape=val_metrics["smape"],
@@ -219,7 +230,12 @@ class XgboostEvaluator(ForecastEvaluator):
                 aic=None,
                 success=True,
                 message=_build_feedback_message(val_metrics, params),
-                metrics={**val_metrics, "best_iteration": int(best_iteration)},
+                metrics={
+                    **val_metrics,
+                    "best_iteration": int(best_iteration),
+                    **data_debug,
+                    **split_debug,
+                },
             )
         except Exception as exc:  # noqa: BLE001
             return _failed_feedback(f"XGBoost 推理失败: {exc}")
@@ -358,12 +374,12 @@ class AutoXgboostForecastAgent(ForecastAgent):
 
     def refit_and_forecast(self, task: ForecastTask, params: XgboostHyperParams) -> dict[str, Any]:
         ctx = load_task_context(task)
-        train_df, future_df, feature_cols = _prepare_train_and_future(ctx, params)
+        train_df, future_df, feature_cols, data_debug = _prepare_train_and_future(ctx, params)
         X_train = train_df[feature_cols].to_numpy(dtype=float)
         y_train = train_df[TARGET_COL].to_numpy(dtype=float)
         X_future = future_df[feature_cols].to_numpy(dtype=float)
 
-        _, best_iteration, _ = _fit_with_early_stopping(X_train, y_train, params)
+        _, best_iteration, _, split_debug = _fit_with_early_stopping(X_train, y_train, params)
         model = _refit_full_train(X_train, y_train, params, best_iteration=best_iteration)
         yhat = np.asarray(model.predict(X_future), dtype=float)
         forecast_df = pd.DataFrame({"ds": ctx.future_index, "yhat": yhat})
@@ -381,6 +397,10 @@ class AutoXgboostForecastAgent(ForecastAgent):
             "ctx": ctx,
             "feature_importance": importance,
             "best_iteration": int(best_iteration),
+            "data_debug": {
+                **data_debug,
+                **split_debug,
+            },
         }
 
     def save_outputs(
@@ -429,6 +449,7 @@ class AutoXgboostForecastAgent(ForecastAgent):
             "trace_size": len(self.trace),
             "test_metrics": forecast_metrics(y_true, y_pred),
             "best_iteration": final_result.get("best_iteration"),
+            "data_debug": final_result.get("data_debug", {}),
             "feature_importance": final_result.get("feature_importance", {}),
             result_path_key: str(result_path),
         }
@@ -465,6 +486,14 @@ class AutoXgboostForecastAgent(ForecastAgent):
                     "mae": feedback.mae if feedback else None,
                     "bias": feedback.bias if feedback else None,
                     "best_iteration": (feedback.metrics.get("best_iteration") if feedback and feedback.metrics else None),
+                    "train_rows_before_context": (
+                        feedback.metrics.get("train_rows_before_context") if feedback and feedback.metrics else None
+                    ),
+                    "train_rows_after_context": (
+                        feedback.metrics.get("train_rows_after_context") if feedback and feedback.metrics else None
+                    ),
+                    "fit_train_rows": (feedback.metrics.get("fit_train_rows") if feedback and feedback.metrics else None),
+                    "fit_val_rows": (feedback.metrics.get("fit_val_rows") if feedback and feedback.metrics else None),
                     "message": feedback.message if feedback else "",
                 }
             )
