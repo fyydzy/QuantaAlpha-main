@@ -120,10 +120,21 @@ def compute_score_metrics(
 
 def forecast_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
     metrics = compute_score_metrics(y_true, y_pred)
+    y_true_arr = np.asarray(y_true, dtype=float)
+    y_pred_arr = np.asarray(y_pred, dtype=float)
+    err = y_true_arr - y_pred_arr
+    mse = float(np.mean(np.square(err)))
+    ss_res = float(np.sum(np.square(err)))
+    ss_tot = float(np.sum(np.square(y_true_arr - float(np.mean(y_true_arr))))) if len(y_true_arr) else 0.0
+    r2 = float("nan")
+    if ss_tot > 1e-12:
+        r2 = 1.0 - ss_res / ss_tot
     return {
         "MAE": metrics["mae"],
+        "MSE": mse,
+        "MAPE": metrics["mape"],
         "RMSE": metrics["rmse"],
-        "MAPE(%)": metrics["mape"],
+        "R2": r2,
     }
 
 

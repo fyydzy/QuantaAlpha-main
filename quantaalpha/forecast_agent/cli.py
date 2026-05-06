@@ -122,7 +122,8 @@ def _extract_test_metrics(result: dict[str, Any]) -> dict[str, float] | None:
 def _test_metrics_selection_key(test_metrics: dict[str, Any] | None) -> tuple[float, float]:
     if not isinstance(test_metrics, dict):
         return (float("inf"), float("inf"))
-    mape = float(test_metrics.get("MAPE(%)", float("inf")))
+    # 兼容旧键名：MAPE(%) -> MAPE
+    mape = float(test_metrics.get("MAPE", test_metrics.get("MAPE(%)", float("inf"))))
     rmse = float(test_metrics.get("RMSE", float("inf")))
     return (mape, rmse)
 
@@ -208,7 +209,7 @@ def main() -> None:
 
         selection_payload = {
             "backend": "auto_select",
-            "selection_metric": "test_metrics.MAPE(%)",
+            "selection_metric": "test_metrics.MAPE",
             "best_model": best_result.get("backend"),
             "best_result": best_result,
             "candidates": all_results,
