@@ -73,7 +73,13 @@ mlruns/
 reports/
 backtest_v2_results/
 backtest_v2_results*/
+forecast_agent_output/
+.claude/
+.wolf/
 
+*.csv
+*.json
+*.xlsx
 # ---- Factor library outputs (generated at runtime) ----
 all_factors_library*.json
 

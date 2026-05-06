@@ -8,9 +8,15 @@ import pandas as pd
 from quantaalpha.forecast_agent.data import MONTH_COL, TARGET_COL
 
 
-DEFAULT_HDD_BASE_TEMP = 15.0
-WEATHER_INPUT_COLS = ("avg_temp", "max_temp", "min_temp")
-WEATHER_FEATURE_COLS = ("avg_temp", "max_temp", "min_temp", "HDD", "temp_range")
+WEATHER_INPUT_COLS = ("avg_temp", "max_temp", "min_temp", "HDD", "extreme_cold_days")
+WEATHER_FEATURE_COLS = (
+    "avg_temp",
+    "max_temp",
+    "min_temp",
+    "HDD",
+    "extreme_cold_days",
+    "temp_range",
+)
 SARIMAX_EXOG_COLS = WEATHER_FEATURE_COLS
 
 
@@ -18,23 +24,26 @@ def add_weather_features(
     df: pd.DataFrame,
     *,
     avg_temp_col: str = "avg_temp",
+    hdd_col: str = "HDD",
+    cold_days_col: str = "extreme_cold_days",
     max_temp_col: str = "max_temp",
     min_temp_col: str = "min_temp",
-    hdd_base_temp: float = DEFAULT_HDD_BASE_TEMP,
     inplace: bool = False,
 ) -> pd.DataFrame:
-    """添加 SARIMAX 外生变量会用到的天气特征。"""
-    required = {avg_temp_col, max_temp_col, min_temp_col}
+    """校验底层聚合天气特征，并补充月度温差 ``temp_range``。"""
+    required = {avg_temp_col, hdd_col, cold_days_col, max_temp_col, min_temp_col}
     missing = required - set(df.columns)
     if missing:
-        raise ValueError(f"缺少温度列，无法进行特征工程: {sorted(missing)}")
+        raise ValueError(f"底层数据缺失必要的气象列: {sorted(missing)}")
 
     out = df if inplace else df.copy()
-    avg_temp = pd.to_numeric(out[avg_temp_col], errors="coerce")
+    out[avg_temp_col] = pd.to_numeric(out[avg_temp_col], errors="coerce")
+    out[hdd_col] = pd.to_numeric(out[hdd_col], errors="coerce")
+    out[cold_days_col] = pd.to_numeric(out[cold_days_col], errors="coerce")
     max_temp = pd.to_numeric(out[max_temp_col], errors="coerce")
     min_temp = pd.to_numeric(out[min_temp_col], errors="coerce")
 
-    out["HDD"] = (hdd_base_temp - avg_temp).clip(lower=0.0)
+    # HDD / extreme_cold_days 来自日度聚合；这里仅生成月内极差。
     out["temp_range"] = max_temp - min_temp
     return out
 
@@ -81,13 +90,32 @@ def add_lag_features(
     return out
 
 
+def add_lag_rolling_features(
+    df: pd.DataFrame,
+    *,
+    target_col: str = TARGET_COL,
+    month_col: str = MONTH_COL,
+    lags: tuple[int, ...] = (12,),
+    inplace: bool = False,
+) -> pd.DataFrame:
+    """兼容旧脚本命名；当前只生成滞后项。"""
+    return add_lag_features(
+        df,
+        target_col=target_col,
+        month_col=month_col,
+        lags=lags,
+        inplace=inplace,
+    )
+
+
 def add_interaction_features(
     df: pd.DataFrame,
     *,
+    cold_days_col: str = "extreme_cold_days",
     inplace: bool = False,
 ) -> pd.DataFrame:
-    """添加基于 HDD、供暖季与 12 月滞后的交互特征。"""
-    required = {"HDD", "Lag_12", "is_heating_season"}
+    """添加基于 HDD、极端低温天数、供暖季与 12 月滞后的交互特征。"""
+    required = {"HDD", cold_days_col, "Lag_12", "is_heating_season"}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"缺少前置依赖特征: {sorted(missing)}")
@@ -96,6 +124,7 @@ def add_interaction_features(
     out["HDD_squared"] = out["HDD"] ** 2
     out["HDD_cross_Lag_12"] = out["HDD"] * out["Lag_12"]
     out["HDD_cross_HeatingSeason"] = out["HDD"] * out["is_heating_season"]
+    out["ColdDays_cross_Lag_12"] = out[cold_days_col] * out["Lag_12"]
     return out
 
 
@@ -118,13 +147,13 @@ def build_features_pipeline(
 
 
 __all__ = [
-    "DEFAULT_HDD_BASE_TEMP",
     "WEATHER_INPUT_COLS",
     "WEATHER_FEATURE_COLS",
     "SARIMAX_EXOG_COLS",
     "add_weather_features",
     "add_time_features",
     "add_lag_features",
+    "add_lag_rolling_features",
     "add_interaction_features",
     "build_features_pipeline",
 ]

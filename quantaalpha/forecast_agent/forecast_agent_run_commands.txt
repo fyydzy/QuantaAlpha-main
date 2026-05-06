@@ -57,5 +57,6 @@ uv run python -m quantaalpha.forecast_agent.cli --model sarimax --province 河�
 # 自动搜索仅在 context_len 上做网格枚举。
 #
 # ---- SARIMAX 与外生变量（代码行为，无独立命令行开关）----
-# SARIMAX 使用 avg_temp/max_temp/min_temp 以及派生的 HDD/temp_range 作为外生变量；
-# 输入 Excel 必须包含 month/gas_sales/avg_temp/max_temp/min_temp。
+# SARIMAX 使用 avg_temp/max_temp/min_temp/HDD/extreme_cold_days/temp_range 作为外生变量；
+# 其中 HDD/extreme_cold_days 来自底层日度聚合，temp_range 由 max_temp - min_temp 生成；
+# 输入 Excel 必须包含 month/gas_sales/avg_temp/max_temp/min_temp/HDD/extreme_cold_days。
