@@ -1,4 +1,4 @@
-"""Lasso 预测后端。"""
+"""CatBoost 预测后端（保留随机网格搜索，仅固定 context_len）。"""
 
 from __future__ import annotations
 
@@ -10,8 +10,6 @@ from typing import Any
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import LassoCV
-from sklearn.preprocessing import StandardScaler
 
 from quantaalpha.forecast_agent.data import (
     MONTH_COL,
@@ -34,13 +32,33 @@ from quantaalpha.forecast_agent.framework import (
     ForecastTask,
 )
 
+EARLY_STOPPING_ROUNDS = 50
+RANDOM_SEARCH_N_TRIALS = 200
+RANDOM_SEARCH_SEED = 42
+
 
 @dataclass(frozen=True)
-class LassoHyperParams:
+class CatboostHyperParams:
     context_len: int = 111
+    depth: int = 4
+    learning_rate: float = 0.03
+    l2_leaf_reg: float = 3.0
+    random_strength: float = 0.5
+    min_data_in_leaf: int = 10
+    subsample: float = 0.8
+    rsm: float = 0.8
 
-    def signature(self) -> tuple[int]:
-        return (self.context_len,)
+    def signature(self) -> tuple[Any, ...]:
+        return (
+            self.context_len,
+            self.depth,
+            self.learning_rate,
+            self.l2_leaf_reg,
+            self.random_strength,
+            self.min_data_in_leaf,
+            self.subsample,
+            self.rsm,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -60,7 +78,7 @@ def _failed_feedback(message: str) -> ForecastFeedback:
     )
 
 
-def _build_feedback_message(metrics: dict[str, float], params: LassoHyperParams) -> str:
+def _build_feedback_message(metrics: dict[str, float], params: CatboostHyperParams) -> str:
     notes: list[str] = []
     if metrics["smape"] > 35:
         notes.append("测试集误差较高")
@@ -68,7 +86,7 @@ def _build_feedback_message(metrics: dict[str, float], params: LassoHyperParams)
         notes.append("预测存在系统性偏差")
     if params.context_len < 24:
         notes.append("上下文长度偏短")
-    return "；".join(notes) if notes else "Lasso 当前配置较稳定"
+    return "；".join(notes) if notes else "CatBoost 当前配置较稳定"
 
 
 def _load_feature_frame(path: str) -> pd.DataFrame:
@@ -76,7 +94,7 @@ def _load_feature_frame(path: str) -> pd.DataFrame:
     required = {MONTH_COL, TARGET_COL, *WEATHER_INPUT_COLS}
     missing = required - set(raw.columns)
     if missing:
-        raise ValueError(f"文件缺少 Lasso 所需列: {sorted(missing)}")
+        raise ValueError(f"文件缺少 CatBoost 所需列: {sorted(missing)}")
 
     out = raw[list(required)].copy()
     out[MONTH_COL] = out[MONTH_COL].astype(str).str.slice(0, 7)
@@ -95,7 +113,7 @@ def _apply_context_window(df: pd.DataFrame, context_len: int) -> pd.DataFrame:
 
 def _prepare_train_and_future(
     ctx: TaskContext,
-    params: LassoHyperParams,
+    params: CatboostHyperParams,
 ) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
     path = str(ctx.metadata["excel_path"])
     as_of = str(ctx.metadata["as_of_month"])
@@ -109,65 +127,178 @@ def _prepare_train_and_future(
     future_df = feature_df[feature_df[MONTH_COL].isin(ctx.forecast_months)].sort_values(MONTH_COL)
     if len(future_df) != len(ctx.forecast_months):
         missing = sorted(set(ctx.forecast_months) - set(future_df[MONTH_COL].astype(str)))
-        raise ValueError(f"Lasso 特征月份不完整，缺少: {missing}")
+        raise ValueError(f"CatBoost 特征月份不完整，缺少: {missing}")
 
     feature_cols = [c for c in feature_df.columns if c not in {MONTH_COL, TARGET_COL}]
     return train_df, future_df, feature_cols
 
 
-def _fit_lasso_cv(X_train: np.ndarray, y_train: np.ndarray) -> tuple[LassoCV, StandardScaler]:
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X_train)
-    cv = max(2, min(5, len(X_scaled)))
-    model = LassoCV(cv=cv, random_state=42, max_iter=10000, alphas=200).fit(X_scaled, y_train)
-    return model, scaler
+def _split_train_val(
+    X_full: np.ndarray,
+    y_full: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    n = len(X_full)
+    val_size = min(12, max(6, n // 5))
+    split_idx = n - val_size
+    if split_idx <= 0:
+        split_idx = max(1, n - 1)
+    return X_full[:split_idx], y_full[:split_idx], X_full[split_idx:], y_full[split_idx:]
 
 
-class LassoEvaluator(ForecastEvaluator):
+def _fit_with_early_stopping(
+    X_train_full: np.ndarray,
+    y_train_full: np.ndarray,
+    params: CatboostHyperParams,
+) -> tuple[Any, int, dict[str, float]]:
+    from catboost import CatBoostRegressor  # type: ignore[import-not-found]
+
+    X_train, y_train, X_val, y_val = _split_train_val(X_train_full, y_train_full)
+    model = CatBoostRegressor(
+        iterations=800,
+        depth=int(params.depth),
+        learning_rate=float(params.learning_rate),
+        l2_leaf_reg=float(params.l2_leaf_reg),
+        random_strength=float(params.random_strength),
+        min_data_in_leaf=int(params.min_data_in_leaf),
+        subsample=float(params.subsample),
+        rsm=float(params.rsm),
+        loss_function="RMSE",
+        random_seed=42,
+        allow_writing_files=False,
+        verbose=False,
+    )
+    model.fit(
+        X_train,
+        y_train,
+        eval_set=(X_val, y_val),
+        use_best_model=True,
+        early_stopping_rounds=EARLY_STOPPING_ROUNDS,
+        verbose=False,
+    )
+    val_pred = np.asarray(model.predict(X_val), dtype=float)
+    val_metrics = compute_score_metrics(y_val.astype(float), val_pred)
+    best_iteration = int(model.get_best_iteration())
+    if best_iteration < 0:
+        best_iteration = 799
+    return model, best_iteration, val_metrics
+
+
+def _refit_full_train(
+    X_train_full: np.ndarray,
+    y_train_full: np.ndarray,
+    params: CatboostHyperParams,
+    best_iteration: int,
+) -> Any:
+    from catboost import CatBoostRegressor  # type: ignore[import-not-found]
+
+    model = CatBoostRegressor(
+        iterations=max(int(best_iteration) + 1, 50),
+        depth=int(params.depth),
+        learning_rate=float(params.learning_rate),
+        l2_leaf_reg=float(params.l2_leaf_reg),
+        random_strength=float(params.random_strength),
+        min_data_in_leaf=int(params.min_data_in_leaf),
+        subsample=float(params.subsample),
+        rsm=float(params.rsm),
+        loss_function="RMSE",
+        random_seed=42,
+        allow_writing_files=False,
+        verbose=False,
+    )
+    model.fit(X_train_full, y_train_full, verbose=False)
+    return model
+
+
+class CatboostEvaluator(ForecastEvaluator):
     def evaluate(self, task: ForecastTask, subjects: ForecastSubjects) -> ForecastFeedback:
         ctx = load_task_context(task)
-        params: LassoHyperParams = subjects.params  # type: ignore[assignment]
+        params: CatboostHyperParams = subjects.params  # type: ignore[assignment]
         try:
-            train_df, future_df, feature_cols = _prepare_train_and_future(ctx, params)
+            train_df, _, feature_cols = _prepare_train_and_future(ctx, params)
             X_train = train_df[feature_cols].to_numpy(dtype=float)
             y_train = train_df[TARGET_COL].to_numpy(dtype=float)
-            X_future = future_df[feature_cols].to_numpy(dtype=float)
 
-            model, scaler = _fit_lasso_cv(X_train, y_train)
-            yhat = np.asarray(model.predict(scaler.transform(X_future)), dtype=float)
-            _, y_true, y_pred = build_result_table(ctx, yhat)
-            metrics = compute_score_metrics(y_true, y_pred)
+            _, best_iteration, val_metrics = _fit_with_early_stopping(X_train, y_train, params)
             return ForecastFeedback(
-                score=metrics["score"],
-                smape=metrics["smape"],
-                mape=metrics["mape"],
-                rmse=metrics["rmse"],
-                mae=metrics["mae"],
-                bias=metrics["bias"],
+                score=val_metrics["score"],
+                smape=val_metrics["smape"],
+                mape=val_metrics["mape"],
+                rmse=val_metrics["rmse"],
+                mae=val_metrics["mae"],
+                bias=val_metrics["bias"],
                 aic=None,
                 success=True,
-                message=_build_feedback_message(metrics, params),
-                metrics={**metrics, "alpha": float(model.alpha_)},
+                message=_build_feedback_message(val_metrics, params),
+                metrics={**val_metrics, "best_iteration": int(best_iteration)},
             )
         except Exception as exc:  # noqa: BLE001
-            return _failed_feedback(f"Lasso 推理失败: {exc}")
+            return _failed_feedback(f"CatBoost 推理失败: {exc}")
 
 
-class FixedLassoStrategy(ForecastStrategy):
-    def __init__(self, context_len: int = 111) -> None:
+class RandomGridCatboostStrategy(ForecastStrategy):
+    def __init__(
+        self,
+        context_len: int = 111,
+        n_trials: int = RANDOM_SEARCH_N_TRIALS,
+        random_seed: int = RANDOM_SEARCH_SEED,
+    ) -> None:
         self.context_len = int(context_len)
+        self.n_trials = int(n_trials)
+        self.random_seed = int(random_seed)
 
     def seed_subjects(self, task: ForecastTask) -> list[ForecastSubjects]:
-        params = LassoHyperParams(context_len=self.context_len)
+        grid_depth = (3, 4, 5)
+        grid_learning_rate = (0.02, 0.03, 0.05)
+        grid_l2_leaf_reg = (1.0, 3.0, 5.0)
+        grid_random_strength = (0.0, 0.5, 1.0)
+        grid_min_data_in_leaf = (5, 10, 20)
+        grid_subsample = (0.7, 0.8)
+        grid_rsm = (0.7, 0.8)
+
+        candidates: list[CatboostHyperParams] = []
+        for depth in grid_depth:
+            for learning_rate in grid_learning_rate:
+                for l2_leaf_reg in grid_l2_leaf_reg:
+                    for random_strength in grid_random_strength:
+                        for min_data_in_leaf in grid_min_data_in_leaf:
+                            for subsample in grid_subsample:
+                                for rsm in grid_rsm:
+                                    candidates.append(
+                                        CatboostHyperParams(
+                                            context_len=self.context_len,
+                                            depth=int(depth),
+                                            learning_rate=float(learning_rate),
+                                            l2_leaf_reg=float(l2_leaf_reg),
+                                            random_strength=float(random_strength),
+                                            min_data_in_leaf=int(min_data_in_leaf),
+                                            subsample=float(subsample),
+                                            rsm=float(rsm),
+                                        )
+                                    )
+
+        rng = np.random.default_rng(self.random_seed)
+        total = len(candidates)
+        n_trials = min(max(1, self.n_trials), total)
+        chosen_idx = rng.choice(total, size=n_trials, replace=False)
+        sampled = [candidates[int(i)] for i in chosen_idx]
+
         return [
             ForecastSubjects(
                 params=params,
-                metadata={"reason": f"固定 context_len={params.context_len}"},
+                metadata={
+                    "reason": (
+                        "随机网格候选 "
+                        f"depth={params.depth}, lr={params.learning_rate}, "
+                        f"l2_leaf_reg={params.l2_leaf_reg}, random_strength={params.random_strength}, "
+                        f"min_data_in_leaf={params.min_data_in_leaf}, subsample={params.subsample}, rsm={params.rsm}"
+                    )
+                },
             )
+            for params in sampled
         ]
 
 
-class AutoLassoForecastAgent(ForecastAgent):
+class AutoCatboostForecastAgent(ForecastAgent):
     def __init__(
         self,
         context_len: int = 111,
@@ -176,8 +307,8 @@ class AutoLassoForecastAgent(ForecastAgent):
         selection_metric: str = "mape",
     ) -> None:
         super().__init__(
-            strategy=strategy or FixedLassoStrategy(context_len=context_len),
-            evaluator=evaluator or LassoEvaluator(),
+            strategy=strategy or RandomGridCatboostStrategy(context_len=context_len),
+            evaluator=evaluator or CatboostEvaluator(),
         )
         metric = (selection_metric or "mape").lower()
         if metric not in {"mape", "score"}:
@@ -215,7 +346,7 @@ class AutoLassoForecastAgent(ForecastAgent):
         forecast_head = final_result["forecast_df"].head(10).copy()
         forecast_head["ds"] = format_month_ds_for_display(forecast_head["ds"])
         return {
-            "backend": "lasso",
+            "backend": "catboost",
             "best_params": best_step.evolvable_subjects.params.to_dict(),
             "best_feedback": asdict(best_step.feedback),
             "trace_size": len(self.trace),
@@ -232,26 +363,34 @@ class AutoLassoForecastAgent(ForecastAgent):
                 if len(messages) >= 3:
                     break
         suffix = f" Sample errors: {' | '.join(messages)}" if messages else ""
-        return f"Lasso forecast agent failed to find a valid configuration.{suffix}"
+        return f"CatBoost forecast agent failed to find a valid configuration.{suffix}"
 
-    def refit_and_forecast(self, task: ForecastTask, params: LassoHyperParams) -> dict[str, Any]:
+    def refit_and_forecast(self, task: ForecastTask, params: CatboostHyperParams) -> dict[str, Any]:
         ctx = load_task_context(task)
         train_df, future_df, feature_cols = _prepare_train_and_future(ctx, params)
         X_train = train_df[feature_cols].to_numpy(dtype=float)
         y_train = train_df[TARGET_COL].to_numpy(dtype=float)
         X_future = future_df[feature_cols].to_numpy(dtype=float)
 
-        model, scaler = _fit_lasso_cv(X_train, y_train)
-        yhat = np.asarray(model.predict(scaler.transform(X_future)), dtype=float)
-        coef = pd.Series(model.coef_, index=feature_cols)
-        selected = coef[coef.abs() > 1e-8].sort_values(key=np.abs, ascending=False)
+        _, best_iteration, _ = _fit_with_early_stopping(X_train, y_train, params)
+        model = _refit_full_train(X_train, y_train, params, best_iteration=best_iteration)
+        yhat = np.asarray(model.predict(X_future), dtype=float)
         forecast_df = pd.DataFrame({"ds": ctx.future_index, "yhat": yhat})
+
+        importance: dict[str, float] = {}
+        try:
+            fi = np.asarray(model.get_feature_importance(), dtype=float)
+            if len(fi) == len(feature_cols):
+                importance = pd.Series(fi, index=feature_cols).sort_values(ascending=False).to_dict()
+        except Exception:
+            importance = {}
+
         return {
             "series": ctx.series,
             "forecast_df": forecast_df,
             "ctx": ctx,
-            "alpha": float(model.alpha_),
-            "selected_features": selected.to_dict(),
+            "feature_importance": importance,
+            "best_iteration": int(best_iteration),
         }
 
     def save_outputs(
@@ -263,10 +402,10 @@ class AutoLassoForecastAgent(ForecastAgent):
         output_dir = Path(task.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        trace_path = output_dir / "lasso_search_trace.csv"
-        forecast_path = output_dir / "lasso_forecast.csv"
-        summary_path = output_dir / "lasso_best_summary.json"
-        plot_path = output_dir / "lasso_forecast_plot.png"
+        trace_path = output_dir / "catboost_search_trace.csv"
+        forecast_path = output_dir / "catboost_forecast.csv"
+        summary_path = output_dir / "catboost_best_summary.json"
+        plot_path = output_dir / "catboost_forecast_plot.png"
 
         pd.DataFrame(self._trace_rows()).to_csv(trace_path, index=False, encoding="utf-8-sig")
         final_result["forecast_df"].to_csv(forecast_path, index=False, encoding="utf-8-sig")
@@ -276,19 +415,20 @@ class AutoLassoForecastAgent(ForecastAgent):
             ctx,
             final_result["forecast_df"]["yhat"].to_numpy(),
         )
-        test_xlsx = output_dir / "lasso_test.xlsx"
+
+        test_xlsx = output_dir / "catboost_test.xlsx"
         try:
             result_df.to_excel(test_xlsx, index=False, sheet_name="test")
             result_path_key = "test_xlsx"
             result_path = test_xlsx
         except Exception:
-            test_csv = output_dir / "lasso_test.csv"
+            test_csv = output_dir / "catboost_test.csv"
             result_df.to_csv(test_csv, index=False, encoding="utf-8-sig")
             result_path_key = "test_csv"
             result_path = test_csv
 
         summary: dict[str, Any] = {
-            "backend": "lasso",
+            "backend": "catboost",
             "task": {
                 **ctx.metadata,
                 "horizon": ctx.horizon,
@@ -298,8 +438,8 @@ class AutoLassoForecastAgent(ForecastAgent):
             "best_feedback": asdict(best_step.feedback) if best_step.feedback else {},
             "trace_size": len(self.trace),
             "test_metrics": forecast_metrics(y_true, y_pred),
-            "alpha": final_result.get("alpha"),
-            "selected_features": final_result.get("selected_features", {}),
+            "best_iteration": final_result.get("best_iteration"),
+            "feature_importance": final_result.get("feature_importance", {}),
             result_path_key: str(result_path),
         }
         summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -322,22 +462,22 @@ class AutoLassoForecastAgent(ForecastAgent):
         rows: list[dict[str, Any]] = []
         for idx, step in enumerate(self.trace, start=1):
             feedback = step.feedback
-            row = {
-                "trial": idx,
-                "proposal_reason": step.proposal_reason,
-                **step.evolvable_subjects.params.to_dict(),
-                "success": feedback.success if feedback else False,
-                "score": feedback.score if feedback else None,
-                "smape": feedback.smape if feedback else None,
-                "mape": feedback.mape if feedback else None,
-                "rmse": feedback.rmse if feedback else None,
-                "mae": feedback.mae if feedback else None,
-                "bias": feedback.bias if feedback else None,
-                "aic": feedback.aic if feedback else None,
-                "alpha": (feedback.metrics.get("alpha") if feedback and feedback.metrics else None),
-                "message": feedback.message if feedback else "",
-            }
-            rows.append(row)
+            rows.append(
+                {
+                    "trial": idx,
+                    "proposal_reason": step.proposal_reason,
+                    **step.evolvable_subjects.params.to_dict(),
+                    "success": feedback.success if feedback else False,
+                    "score": feedback.score if feedback else None,
+                    "smape": feedback.smape if feedback else None,
+                    "mape": feedback.mape if feedback else None,
+                    "rmse": feedback.rmse if feedback else None,
+                    "mae": feedback.mae if feedback else None,
+                    "bias": feedback.bias if feedback else None,
+                    "best_iteration": (feedback.metrics.get("best_iteration") if feedback and feedback.metrics else None),
+                    "message": feedback.message if feedback else "",
+                }
+            )
         return rows
 
     @staticmethod
@@ -345,7 +485,7 @@ class AutoLassoForecastAgent(ForecastAgent):
         plt.figure(figsize=(14, 6))
         plt.plot(series.index, series.values, label="history", color="tab:blue")
         plt.plot(pd.to_datetime(forecast_df["ds"]), forecast_df["yhat"], label="forecast", color="tab:orange")
-        plt.title("Forecast Agent - Auto Lasso")
+        plt.title("Forecast Agent - Auto CatBoost")
         plt.xlabel("Date")
         plt.ylabel("y")
         plt.legend()
@@ -355,8 +495,8 @@ class AutoLassoForecastAgent(ForecastAgent):
 
 
 __all__ = [
-    "LassoHyperParams",
-    "LassoEvaluator",
-    "FixedLassoStrategy",
-    "AutoLassoForecastAgent",
+    "CatboostHyperParams",
+    "CatboostEvaluator",
+    "RandomGridCatboostStrategy",
+    "AutoCatboostForecastAgent",
 ]

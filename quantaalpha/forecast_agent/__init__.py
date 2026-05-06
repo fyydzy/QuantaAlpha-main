@@ -25,6 +25,24 @@ from quantaalpha.forecast_agent.lasso_agent import (
     LassoEvaluator,
     LassoHyperParams,
 )
+from quantaalpha.forecast_agent.xgboost_agent import (
+    AutoXgboostForecastAgent,
+    RandomGridXgboostStrategy,
+    XgboostEvaluator,
+    XgboostHyperParams,
+)
+from quantaalpha.forecast_agent.lightgbm_agent import (
+    AutoLightgbmForecastAgent,
+    RandomGridLightgbmStrategy,
+    LightgbmEvaluator,
+    LightgbmHyperParams,
+)
+from quantaalpha.forecast_agent.catboost_agent import (
+    AutoCatboostForecastAgent,
+    RandomGridCatboostStrategy,
+    CatboostEvaluator,
+    CatboostHyperParams,
+)
 
 __all__ = [
     "ForecastAgent",
@@ -46,4 +64,16 @@ __all__ = [
     "LassoEvaluator",
     "FixedLassoStrategy",
     "AutoLassoForecastAgent",
+    "XgboostHyperParams",
+    "XgboostEvaluator",
+    "RandomGridXgboostStrategy",
+    "AutoXgboostForecastAgent",
+    "LightgbmHyperParams",
+    "LightgbmEvaluator",
+    "RandomGridLightgbmStrategy",
+    "AutoLightgbmForecastAgent",
+    "CatboostHyperParams",
+    "CatboostEvaluator",
+    "RandomGridCatboostStrategy",
+    "AutoCatboostForecastAgent",
 ]

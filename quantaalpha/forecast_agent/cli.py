@@ -6,9 +6,12 @@ from pathlib import Path
 from typing import Any, Callable
 
 from quantaalpha.forecast_agent.framework import ForecastTask
+from quantaalpha.forecast_agent.catboost_agent import AutoCatboostForecastAgent
 from quantaalpha.forecast_agent.lasso_agent import AutoLassoForecastAgent
+from quantaalpha.forecast_agent.lightgbm_agent import AutoLightgbmForecastAgent
 from quantaalpha.forecast_agent.sarimax_agent import AutoSarimaxForecastAgent
 from quantaalpha.forecast_agent.timesfm_agent import AutoTimesFmForecastAgent
+from quantaalpha.forecast_agent.xgboost_agent import AutoXgboostForecastAgent
 
 
 ModelFactory = Callable[[argparse.Namespace], Any]
@@ -25,6 +28,18 @@ MODEL_FACTORIES: dict[str, ModelFactory] = {
         context_len=args.context_len,
         selection_metric=args.selection_metric,
     ),
+    "xgboost": lambda args: AutoXgboostForecastAgent(
+        context_len=args.context_len,
+        selection_metric=args.selection_metric,
+    ),
+    "lightgbm": lambda args: AutoLightgbmForecastAgent(
+        context_len=args.context_len,
+        selection_metric=args.selection_metric,
+    ),
+    "catboost": lambda args: AutoCatboostForecastAgent(
+        context_len=args.context_len,
+        selection_metric=args.selection_metric,
+    ),
 }
 
 
@@ -34,13 +49,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--model",
-        choices=["auto", "timesfm", "sarimax", "lasso"],
+        choices=["auto", "timesfm", "sarimax", "lasso", "xgboost", "lightgbm", "catboost"],
         default="timesfm",
         help="模型后端名称；auto 为多模型自动比选。",
     )
     parser.add_argument(
         "--candidate-models",
-        default="sarimax,lasso",
+        default="sarimax,lasso,xgboost,lightgbm,catboost",
         help="仅在 --model auto 时生效，逗号分隔的候选模型列表。",
     )
     parser.add_argument("--excel", default=None, help="Excel 路径（与 --province 二选一）")
