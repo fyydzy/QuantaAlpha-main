@@ -1,11 +1,4 @@
-"""TimesFM 预测后端。
-
-当前流程固定为月度 Excel 数据：
-
-1. 使用 ``as_of_month`` 及以前的数据作为训练序列；
-2. 一次性预测 bridge + test 月份；
-3. 仅用 test 月份真实值计算指标，并据此选择最优 ``context_len``。
-"""
+"""Lasso 预测后端。"""
 
 from __future__ import annotations
 
@@ -17,8 +10,12 @@ from typing import Any
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from sklearn.linear_model import LassoCV
+from sklearn.preprocessing import StandardScaler
 
 from quantaalpha.forecast_agent.data import (
+    MONTH_COL,
+    TARGET_COL,
     TaskContext,
     build_result_table,
     compute_score_metrics,
@@ -26,6 +23,7 @@ from quantaalpha.forecast_agent.data import (
     format_month_ds_for_display,
     load_task_context,
 )
+from quantaalpha.forecast_agent.feature_engineering import WEATHER_INPUT_COLS, build_features_pipeline
 from quantaalpha.forecast_agent.framework import (
     ForecastAgent,
     ForecastEvaluator,
@@ -37,149 +35,15 @@ from quantaalpha.forecast_agent.framework import (
 )
 
 
-_PATCH_LEN = 3
-
-
 @dataclass(frozen=True)
-class TimesFmHyperParams:
-    """TimesFM 搜索参数。
-
-    自动搜索只枚举 ``context_len``；其余字段保留为显式实验入口。
-    """
-
+class LassoHyperParams:
     context_len: int = 111
-    freq: int = 2
-    normalize: bool = False
-    log_transform: bool = False
 
-    def signature(self) -> tuple[int, int, bool, bool]:
-        return (self.context_len, self.freq, self.normalize, self.log_transform)
+    def signature(self) -> tuple[int]:
+        return (self.context_len,)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
-
-
-def _round_up(value: int, base: int) -> int:
-    return ((value + base - 1) // base) * base
-
-
-def _build_feedback_message(metrics: dict[str, float], params: TimesFmHyperParams) -> str:
-    notes: list[str] = []
-    if metrics["smape"] > 35:
-        notes.append("测试集误差较高")
-    if abs(metrics["bias"]) > max(metrics["mae"] * 0.2, 1.0):
-        notes.append("预测存在系统性偏差")
-    if params.context_len < 24:
-        notes.append("上下文长度偏短")
-    return "；".join(notes) if notes else "TimesFM 当前配置较稳定"
-
-
-class _TimesFmModelCache:
-    """按 (预测步长桶, 设备类型) 缓存 TimesFM 模型实例。"""
-
-    def __init__(self) -> None:
-        self._cache: dict[tuple[int, str], Any] = {}
-
-    def get(self, horizon_len: int, backend: str = "cpu") -> Any:
-        horizon_bucket = max(_round_up(horizon_len, _PATCH_LEN), _PATCH_LEN)
-        key = (horizon_bucket, backend)
-        if key in self._cache:
-            return self._cache[key]
-
-        import timesfm  # type: ignore[import-not-found]  # 可选依赖，按需延迟导入
-
-        model = timesfm.TimesFm(
-            hparams=timesfm.TimesFmHparams(
-                backend=backend,
-                per_core_batch_size=1,
-                horizon_len=horizon_bucket,
-            ),
-            checkpoint=timesfm.TimesFmCheckpoint(
-                huggingface_repo_id="google/timesfm-1.0-200m-pytorch",
-            ),
-        )
-        self._cache[key] = model
-        return model
-
-
-_MODEL_CACHE = _TimesFmModelCache()
-
-
-def _prepare_context(values: np.ndarray, context_len: int) -> np.ndarray:
-    values = np.asarray(values, dtype=np.float32)
-    tail = values[-context_len:] if context_len > 0 else values
-    pad = (-len(tail)) % _PATCH_LEN
-    if pad:
-        tail = np.concatenate([np.full(pad, np.nan, dtype=np.float32), tail])
-    return tail
-
-
-def _forecast_once(
-    train_values: np.ndarray,
-    horizon_len: int,
-    params: TimesFmHyperParams,
-    backend: str = "cpu",
-) -> np.ndarray:
-    x = np.asarray(train_values, dtype=np.float64)
-
-    if params.log_transform:
-        x = np.log1p(np.clip(x, a_min=0.0, a_max=None))
-
-    mu = 0.0
-    sigma = 1.0
-    if params.normalize:
-        mu = float(np.nanmean(x))
-        sigma = float(np.nanstd(x))
-        if not np.isfinite(sigma) or sigma < 1e-9:
-            sigma = 1.0
-        x = (x - mu) / sigma
-
-    context = _prepare_context(x.astype(np.float32), params.context_len)
-    model = _MODEL_CACHE.get(horizon_len=horizon_len, backend=backend)
-    pred = model.forecast([context], freq=[params.freq])
-    pred_arr = np.asarray(pred[0] if isinstance(pred, tuple) else pred)
-    yhat = (pred_arr[0] if pred_arr.ndim == 2 else pred_arr)[:horizon_len].astype(np.float64)
-
-    if params.normalize:
-        yhat = yhat * sigma + mu
-    if params.log_transform:
-        yhat = np.expm1(yhat)
-    return yhat
-
-
-class TimesFmEvaluator(ForecastEvaluator):
-    def __init__(self, backend: str = "cpu") -> None:
-        self.backend = backend
-
-    def evaluate(self, task: ForecastTask, subjects: ForecastSubjects) -> ForecastFeedback:
-        ctx = load_task_context(task)
-        if len(ctx.series) < 12:
-            return _failed_feedback("训练样本太短，无法评估 TimesFM 参数")
-
-        params: TimesFmHyperParams = subjects.params  # type: ignore[assignment]
-        try:
-            yhat = _forecast_once(
-                ctx.series.values,
-                horizon_len=ctx.horizon,
-                params=params,
-                backend=self.backend,
-            )
-            _, y_true, y_pred = build_result_table(ctx, yhat)
-            metrics = compute_score_metrics(y_true, y_pred)
-            return ForecastFeedback(
-                score=metrics["score"],
-                smape=metrics["smape"],
-                mape=metrics["mape"],
-                rmse=metrics["rmse"],
-                mae=metrics["mae"],
-                bias=metrics["bias"],
-                aic=None,
-                success=True,
-                message=_build_feedback_message(metrics, params),
-                metrics=metrics,
-            )
-        except Exception as exc:  # noqa: BLE001 - 搜索阶段统一转成失败反馈
-            return _failed_feedback(f"TimesFM 推理失败: {exc}")
 
 
 def _failed_feedback(message: str) -> ForecastFeedback:
@@ -196,64 +60,128 @@ def _failed_feedback(message: str) -> ForecastFeedback:
     )
 
 
-class GridTimesFmStrategy(ForecastStrategy):
-    def __init__(
-        self,
-        context_choices: tuple[int, ...] = (
-            60,
-            63,
-            66,
-            69,
-            72,
-            75,
-            78,
-            81,
-            84,
-            87,
-            90,
-            93,
-            96,
-            99,
-            102,
-            105,
-            108,
-            111,
-        ),
-    ) -> None:
-        self.context_choices = context_choices
+def _build_feedback_message(metrics: dict[str, float], params: LassoHyperParams) -> str:
+    notes: list[str] = []
+    if metrics["smape"] > 35:
+        notes.append("测试集误差较高")
+    if abs(metrics["bias"]) > max(metrics["mae"] * 0.2, 1.0):
+        notes.append("预测存在系统性偏差")
+    if params.context_len < 24:
+        notes.append("上下文长度偏短")
+    return "；".join(notes) if notes else "Lasso 当前配置较稳定"
+
+
+def _load_feature_frame(path: str) -> pd.DataFrame:
+    raw = pd.read_excel(path)
+    required = {MONTH_COL, TARGET_COL, *WEATHER_INPUT_COLS}
+    missing = required - set(raw.columns)
+    if missing:
+        raise ValueError(f"文件缺少 Lasso 所需列: {sorted(missing)}")
+
+    out = raw[list(required)].copy()
+    out[MONTH_COL] = out[MONTH_COL].astype(str).str.slice(0, 7)
+    numeric_cols = [TARGET_COL, *WEATHER_INPUT_COLS]
+    for col in numeric_cols:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+    out = out.dropna(subset=numeric_cols).sort_values(MONTH_COL).reset_index(drop=True)
+    return build_features_pipeline(out, target_col=TARGET_COL, month_col=MONTH_COL, dropna=True)
+
+
+def _apply_context_window(df: pd.DataFrame, context_len: int) -> pd.DataFrame:
+    if context_len <= 0 or len(df) <= context_len:
+        return df.copy()
+    return df.iloc[-context_len:].copy()
+
+
+def _prepare_train_and_future(
+    ctx: TaskContext,
+    params: LassoHyperParams,
+) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+    path = str(ctx.metadata["excel_path"])
+    as_of = str(ctx.metadata["as_of_month"])
+    feature_df = _load_feature_frame(path)
+
+    train_df = feature_df[feature_df[MONTH_COL] <= as_of].sort_values(MONTH_COL)
+    train_df = _apply_context_window(train_df, params.context_len)
+    if len(train_df) < 24:
+        raise ValueError(f"context={params.context_len} 样本仅 {len(train_df)} 月，少于 24 月")
+
+    future_df = feature_df[feature_df[MONTH_COL].isin(ctx.forecast_months)].sort_values(MONTH_COL)
+    if len(future_df) != len(ctx.forecast_months):
+        missing = sorted(set(ctx.forecast_months) - set(future_df[MONTH_COL].astype(str)))
+        raise ValueError(f"Lasso 特征月份不完整，缺少: {missing}")
+
+    feature_cols = [c for c in feature_df.columns if c not in {MONTH_COL, TARGET_COL}]
+    return train_df, future_df, feature_cols
+
+
+def _fit_lasso_cv(X_train: np.ndarray, y_train: np.ndarray) -> tuple[LassoCV, StandardScaler]:
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X_train)
+    cv = max(2, min(5, len(X_scaled)))
+    model = LassoCV(cv=cv, random_state=42, max_iter=10000, n_alphas=200).fit(X_scaled, y_train)
+    return model, scaler
+
+
+class LassoEvaluator(ForecastEvaluator):
+    def evaluate(self, task: ForecastTask, subjects: ForecastSubjects) -> ForecastFeedback:
+        ctx = load_task_context(task)
+        params: LassoHyperParams = subjects.params  # type: ignore[assignment]
+        try:
+            train_df, future_df, feature_cols = _prepare_train_and_future(ctx, params)
+            X_train = train_df[feature_cols].to_numpy(dtype=float)
+            y_train = train_df[TARGET_COL].to_numpy(dtype=float)
+            X_future = future_df[feature_cols].to_numpy(dtype=float)
+
+            model, scaler = _fit_lasso_cv(X_train, y_train)
+            yhat = np.asarray(model.predict(scaler.transform(X_future)), dtype=float)
+            _, y_true, y_pred = build_result_table(ctx, yhat)
+            metrics = compute_score_metrics(y_true, y_pred)
+            return ForecastFeedback(
+                score=metrics["score"],
+                smape=metrics["smape"],
+                mape=metrics["mape"],
+                rmse=metrics["rmse"],
+                mae=metrics["mae"],
+                bias=metrics["bias"],
+                aic=None,
+                success=True,
+                message=_build_feedback_message(metrics, params),
+                metrics={**metrics, "alpha": float(model.alpha_)},
+            )
+        except Exception as exc:  # noqa: BLE001
+            return _failed_feedback(f"Lasso 推理失败: {exc}")
+
+
+class FixedLassoStrategy(ForecastStrategy):
+    def __init__(self, context_len: int = 111) -> None:
+        self.context_len = int(context_len)
 
     def seed_subjects(self, task: ForecastTask) -> list[ForecastSubjects]:
-        params_pool: dict[tuple[int, int, bool, bool], TimesFmHyperParams] = {}
-        params_pool[TimesFmHyperParams().signature()] = TimesFmHyperParams()
-        for context_len in self.context_choices:
-            params = TimesFmHyperParams(context_len=context_len)
-            params_pool[params.signature()] = params
-
+        params = LassoHyperParams(context_len=self.context_len)
         return [
             ForecastSubjects(
                 params=params,
-                metadata={"reason": f"网格候选 context_len={params.context_len}"},
+                metadata={"reason": f"固定 context_len={params.context_len}"},
             )
-            for params in params_pool.values()
         ]
 
 
-class AutoTimesFmForecastAgent(ForecastAgent):
+class AutoLassoForecastAgent(ForecastAgent):
     def __init__(
         self,
+        context_len: int = 111,
         strategy: ForecastStrategy | None = None,
         evaluator: ForecastEvaluator | None = None,
-        backend: str = "cpu",
         selection_metric: str = "mape",
     ) -> None:
         super().__init__(
-            strategy=strategy or GridTimesFmStrategy(),
-            evaluator=evaluator or TimesFmEvaluator(backend=backend),
+            strategy=strategy or FixedLassoStrategy(context_len=context_len),
+            evaluator=evaluator or LassoEvaluator(),
         )
         metric = (selection_metric or "mape").lower()
         if metric not in {"mape", "score"}:
             raise ValueError(f"Unsupported selection_metric: {selection_metric}")
-        self.backend = backend
         self.selection_metric = metric
 
     def _selection_key(self, feedback: ForecastFeedback) -> tuple[float, float]:
@@ -271,10 +199,9 @@ class AutoTimesFmForecastAgent(ForecastAgent):
             step = ForecastStep(
                 evolvable_subjects=subject,
                 feedback=feedback,
-                proposal_reason=subject.metadata.get("reason", f"网格候选 #{idx}"),
+                proposal_reason=subject.metadata.get("reason", f"固定候选 #{idx}"),
             )
             self.trace.append(step)
-
             if not feedback.success:
                 continue
             if best_step is None or self._selection_key(feedback) < self._selection_key(best_step.feedback):  # type: ignore[arg-type]
@@ -285,11 +212,10 @@ class AutoTimesFmForecastAgent(ForecastAgent):
 
         final_result = self.refit_and_forecast(task, best_step.evolvable_subjects.params)  # type: ignore[arg-type]
         output_paths = self.save_outputs(task, best_step, final_result)
-
         forecast_head = final_result["forecast_df"].head(10).copy()
         forecast_head["ds"] = format_month_ds_for_display(forecast_head["ds"])
         return {
-            "backend": "timesfm",
+            "backend": "lasso",
             "best_params": best_step.evolvable_subjects.params.to_dict(),
             "best_feedback": asdict(best_step.feedback),
             "trace_size": len(self.trace),
@@ -306,18 +232,27 @@ class AutoTimesFmForecastAgent(ForecastAgent):
                 if len(messages) >= 3:
                     break
         suffix = f" Sample errors: {' | '.join(messages)}" if messages else ""
-        return f"TimesFM forecast agent failed to find a valid configuration.{suffix}"
+        return f"Lasso forecast agent failed to find a valid configuration.{suffix}"
 
-    def refit_and_forecast(self, task: ForecastTask, params: TimesFmHyperParams) -> dict[str, Any]:
+    def refit_and_forecast(self, task: ForecastTask, params: LassoHyperParams) -> dict[str, Any]:
         ctx = load_task_context(task)
-        yhat = _forecast_once(
-            ctx.series.values,
-            horizon_len=ctx.horizon,
-            params=params,
-            backend=self.backend,
-        )
+        train_df, future_df, feature_cols = _prepare_train_and_future(ctx, params)
+        X_train = train_df[feature_cols].to_numpy(dtype=float)
+        y_train = train_df[TARGET_COL].to_numpy(dtype=float)
+        X_future = future_df[feature_cols].to_numpy(dtype=float)
+
+        model, scaler = _fit_lasso_cv(X_train, y_train)
+        yhat = np.asarray(model.predict(scaler.transform(X_future)), dtype=float)
+        coef = pd.Series(model.coef_, index=feature_cols)
+        selected = coef[coef.abs() > 1e-8].sort_values(key=np.abs, ascending=False)
         forecast_df = pd.DataFrame({"ds": ctx.future_index, "yhat": yhat})
-        return {"series": ctx.series, "forecast_df": forecast_df, "ctx": ctx}
+        return {
+            "series": ctx.series,
+            "forecast_df": forecast_df,
+            "ctx": ctx,
+            "alpha": float(model.alpha_),
+            "selected_features": selected.to_dict(),
+        }
 
     def save_outputs(
         self,
@@ -328,10 +263,10 @@ class AutoTimesFmForecastAgent(ForecastAgent):
         output_dir = Path(task.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        trace_path = output_dir / "timesfm_search_trace.csv"
-        forecast_path = output_dir / "timesfm_forecast.csv"
-        summary_path = output_dir / "timesfm_best_summary.json"
-        plot_path = output_dir / "timesfm_forecast_plot.png"
+        trace_path = output_dir / "lasso_search_trace.csv"
+        forecast_path = output_dir / "lasso_forecast.csv"
+        summary_path = output_dir / "lasso_best_summary.json"
+        plot_path = output_dir / "lasso_forecast_plot.png"
 
         pd.DataFrame(self._trace_rows()).to_csv(trace_path, index=False, encoding="utf-8-sig")
         final_result["forecast_df"].to_csv(forecast_path, index=False, encoding="utf-8-sig")
@@ -341,20 +276,19 @@ class AutoTimesFmForecastAgent(ForecastAgent):
             ctx,
             final_result["forecast_df"]["yhat"].to_numpy(),
         )
-
-        test_xlsx = output_dir / "timesfm_test.xlsx"
+        test_xlsx = output_dir / "lasso_test.xlsx"
         try:
             result_df.to_excel(test_xlsx, index=False, sheet_name="test")
             result_path_key = "test_xlsx"
             result_path = test_xlsx
         except Exception:
-            test_csv = output_dir / "timesfm_test.csv"
+            test_csv = output_dir / "lasso_test.csv"
             result_df.to_csv(test_csv, index=False, encoding="utf-8-sig")
             result_path_key = "test_csv"
             result_path = test_csv
 
         summary: dict[str, Any] = {
-            "backend": "timesfm",
+            "backend": "lasso",
             "task": {
                 **ctx.metadata,
                 "horizon": ctx.horizon,
@@ -364,6 +298,8 @@ class AutoTimesFmForecastAgent(ForecastAgent):
             "best_feedback": asdict(best_step.feedback) if best_step.feedback else {},
             "trace_size": len(self.trace),
             "test_metrics": forecast_metrics(y_true, y_pred),
+            "alpha": final_result.get("alpha"),
+            "selected_features": final_result.get("selected_features", {}),
             result_path_key: str(result_path),
         }
         summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -386,21 +322,22 @@ class AutoTimesFmForecastAgent(ForecastAgent):
         rows: list[dict[str, Any]] = []
         for idx, step in enumerate(self.trace, start=1):
             feedback = step.feedback
-            rows.append(
-                {
-                    "trial": idx,
-                    "proposal_reason": step.proposal_reason,
-                    **step.evolvable_subjects.params.to_dict(),
-                    "success": feedback.success if feedback else False,
-                    "score": feedback.score if feedback else None,
-                    "smape": feedback.smape if feedback else None,
-                    "mape": feedback.mape if feedback else None,
-                    "rmse": feedback.rmse if feedback else None,
-                    "mae": feedback.mae if feedback else None,
-                    "bias": feedback.bias if feedback else None,
-                    "message": feedback.message if feedback else "",
-                }
-            )
+            row = {
+                "trial": idx,
+                "proposal_reason": step.proposal_reason,
+                **step.evolvable_subjects.params.to_dict(),
+                "success": feedback.success if feedback else False,
+                "score": feedback.score if feedback else None,
+                "smape": feedback.smape if feedback else None,
+                "mape": feedback.mape if feedback else None,
+                "rmse": feedback.rmse if feedback else None,
+                "mae": feedback.mae if feedback else None,
+                "bias": feedback.bias if feedback else None,
+                "aic": feedback.aic if feedback else None,
+                "alpha": (feedback.metrics.get("alpha") if feedback and feedback.metrics else None),
+                "message": feedback.message if feedback else "",
+            }
+            rows.append(row)
         return rows
 
     @staticmethod
@@ -408,7 +345,7 @@ class AutoTimesFmForecastAgent(ForecastAgent):
         plt.figure(figsize=(14, 6))
         plt.plot(series.index, series.values, label="history", color="tab:blue")
         plt.plot(pd.to_datetime(forecast_df["ds"]), forecast_df["yhat"], label="forecast", color="tab:orange")
-        plt.title("Forecast Agent - Auto TimesFM")
+        plt.title("Forecast Agent - Auto Lasso")
         plt.xlabel("Date")
         plt.ylabel("y")
         plt.legend()
@@ -418,8 +355,8 @@ class AutoTimesFmForecastAgent(ForecastAgent):
 
 
 __all__ = [
-    "TimesFmHyperParams",
-    "TimesFmEvaluator",
-    "GridTimesFmStrategy",
-    "AutoTimesFmForecastAgent",
+    "LassoHyperParams",
+    "LassoEvaluator",
+    "FixedLassoStrategy",
+    "AutoLassoForecastAgent",
 ]

@@ -15,9 +15,15 @@ from quantaalpha.forecast_agent.timesfm_agent import (
 )
 from quantaalpha.forecast_agent.sarimax_agent import (
     AutoSarimaxForecastAgent,
-    GridSarimaxStrategy,
+    FixedSarimaxStrategy,
     SarimaxEvaluator,
     SarimaxHyperParams,
+)
+from quantaalpha.forecast_agent.lasso_agent import (
+    AutoLassoForecastAgent,
+    FixedLassoStrategy,
+    LassoEvaluator,
+    LassoHyperParams,
 )
 
 __all__ = [
@@ -34,6 +40,10 @@ __all__ = [
     "AutoTimesFmForecastAgent",
     "SarimaxHyperParams",
     "SarimaxEvaluator",
-    "GridSarimaxStrategy",
+    "FixedSarimaxStrategy",
     "AutoSarimaxForecastAgent",
+    "LassoHyperParams",
+    "LassoEvaluator",
+    "FixedLassoStrategy",
+    "AutoLassoForecastAgent",
 ]

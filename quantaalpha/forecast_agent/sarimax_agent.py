@@ -4,7 +4,7 @@
 
 1. 使用 ``as_of_month`` 及以前的数据训练；
 2. 一次性预测 bridge + test 月份；
-3. 仅用 test 月份真实值计算指标，并据此选择最优 context 窗口。
+3. 使用外部传入的固定 context 窗口，不再自动搜索最优 context_len。
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ from quantaalpha.forecast_agent.data import (
     build_result_table,
     compute_score_metrics,
     forecast_metrics,
+    format_month_ds_for_display,
     load_task_context,
 )
 from quantaalpha.forecast_agent.feature_engineering import (
@@ -182,57 +183,30 @@ class SarimaxEvaluator(ForecastEvaluator):
             return _failed_feedback(f"SARIMAX 推理失败: {exc}")
 
 
-class GridSarimaxStrategy(ForecastStrategy):
-    def __init__(
-        self,
-        context_choices: tuple[int, ...] = (
-            60,
-            63,
-            66,
-            69,
-            72,
-            75,
-            78,
-            81,
-            84,
-            87,
-            90,
-            93,
-            96,
-            99,
-            102,
-            105,
-            108,
-            111,
-        ),
-    ) -> None:
-        self.context_choices = context_choices
+class FixedSarimaxStrategy(ForecastStrategy):
+    def __init__(self, context_len: int = 111) -> None:
+        self.context_len = int(context_len)
 
     def seed_subjects(self, task: ForecastTask) -> list[ForecastSubjects]:
-        params_pool: dict[tuple[int], SarimaxHyperParams] = {}
-        params_pool[SarimaxHyperParams().signature()] = SarimaxHyperParams()
-        for context_len in self.context_choices:
-            params = SarimaxHyperParams(context_len=context_len)
-            params_pool[params.signature()] = params
-
+        params = SarimaxHyperParams(context_len=self.context_len)
         return [
             ForecastSubjects(
                 params=params,
-                metadata={"reason": f"网格候选 context_len={params.context_len}"},
+                metadata={"reason": f"固定 context_len={params.context_len}"},
             )
-            for params in params_pool.values()
         ]
 
 
 class AutoSarimaxForecastAgent(ForecastAgent):
     def __init__(
         self,
+        context_len: int = 111,
         strategy: ForecastStrategy | None = None,
         evaluator: ForecastEvaluator | None = None,
         selection_metric: str = "mape",
     ) -> None:
         super().__init__(
-            strategy=strategy or GridSarimaxStrategy(),
+            strategy=strategy or FixedSarimaxStrategy(context_len=context_len),
             evaluator=evaluator or SarimaxEvaluator(),
         )
         metric = (selection_metric or "mape").lower()
@@ -255,7 +229,7 @@ class AutoSarimaxForecastAgent(ForecastAgent):
             step = ForecastStep(
                 evolvable_subjects=subject,
                 feedback=feedback,
-                proposal_reason=subject.metadata.get("reason", f"网格候选 #{idx}"),
+                proposal_reason=subject.metadata.get("reason", f"固定候选 #{idx}"),
             )
             self.trace.append(step)
 
@@ -271,7 +245,7 @@ class AutoSarimaxForecastAgent(ForecastAgent):
         output_paths = self.save_outputs(task, best_step, final_result)
 
         forecast_head = final_result["forecast_df"].head(10).copy()
-        forecast_head["ds"] = forecast_head["ds"].astype(str)
+        forecast_head["ds"] = format_month_ds_for_display(forecast_head["ds"])
         return {
             "backend": "sarimax",
             "best_params": best_step.evolvable_subjects.params.to_dict(),
@@ -407,6 +381,6 @@ class AutoSarimaxForecastAgent(ForecastAgent):
 __all__ = [
     "SarimaxHyperParams",
     "SarimaxEvaluator",
-    "GridSarimaxStrategy",
+    "FixedSarimaxStrategy",
     "AutoSarimaxForecastAgent",
 ]

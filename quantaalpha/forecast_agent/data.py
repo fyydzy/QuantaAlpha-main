@@ -233,6 +233,11 @@ def build_result_table(
     )
 
 
+def format_month_ds_for_display(ds: pd.Series) -> pd.Series:
+    """月度序列常用月初 Timestamp；转为 ``YYYY-MM`` 字符串便于 CLI 预览。"""
+    return pd.to_datetime(ds).dt.to_period("M").astype(str)
+
+
 __all__ = [
     "AS_OF_MONTH",
     "TEST_START",
@@ -251,4 +256,5 @@ __all__ = [
     "TaskContext",
     "load_task_context",
     "build_result_table",
+    "format_month_ds_for_display",
 ]
