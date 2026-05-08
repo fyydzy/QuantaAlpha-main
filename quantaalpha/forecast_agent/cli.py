@@ -7,8 +7,12 @@ from typing import Any, Callable
 
 from quantaalpha.forecast_agent.framework import ForecastTask
 from quantaalpha.forecast_agent.catboost_agent import AutoCatboostForecastAgent
+from quantaalpha.forecast_agent.elasticnet_agent import AutoElasticnetForecastAgent
 from quantaalpha.forecast_agent.lasso_agent import AutoLassoForecastAgent
+from quantaalpha.forecast_agent.lstm_agent import AutoLstmForecastAgent
 from quantaalpha.forecast_agent.lightgbm_agent import AutoLightgbmForecastAgent
+from quantaalpha.forecast_agent.random_forest_agent import AutoRandomForestForecastAgent
+from quantaalpha.forecast_agent.ridge_agent import AutoRidgeForecastAgent
 from quantaalpha.forecast_agent.sarimax_agent import AutoSarimaxForecastAgent
 from quantaalpha.forecast_agent.timesfm_agent import AutoTimesFmForecastAgent
 from quantaalpha.forecast_agent.xgboost_agent import AutoXgboostForecastAgent
@@ -28,6 +32,18 @@ MODEL_FACTORIES: dict[str, ModelFactory] = {
         context_len=args.context_len,
         selection_metric=args.selection_metric,
     ),
+    "elasticnet": lambda args: AutoElasticnetForecastAgent(
+        context_len=args.context_len,
+        selection_metric=args.selection_metric,
+    ),
+    "ridge": lambda args: AutoRidgeForecastAgent(
+        context_len=args.context_len,
+        selection_metric=args.selection_metric,
+    ),
+    "lstm": lambda args: AutoLstmForecastAgent(
+        context_len=args.context_len,
+        selection_metric=args.selection_metric,
+    ),
     "xgboost": lambda args: AutoXgboostForecastAgent(
         context_len=args.context_len,
         selection_metric=args.selection_metric,
@@ -40,6 +56,10 @@ MODEL_FACTORIES: dict[str, ModelFactory] = {
         context_len=args.context_len,
         selection_metric=args.selection_metric,
     ),
+    "random_forest": lambda args: AutoRandomForestForecastAgent(
+        context_len=args.context_len,
+        selection_metric=args.selection_metric,
+    ),
 }
 
 
@@ -49,13 +69,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--model",
-        choices=["auto", "timesfm", "sarimax", "lasso", "xgboost", "lightgbm", "catboost"],
+        choices=[
+            "auto",
+            "timesfm",
+            "sarimax",
+            "lasso",
+            "elasticnet",
+            "ridge",
+            "lstm",
+            "xgboost",
+            "lightgbm",
+            "catboost",
+            "random_forest",
+        ],
         default="timesfm",
         help="模型后端名称；auto 为多模型自动比选。",
     )
     parser.add_argument(
         "--candidate-models",
-        default="sarimax,lasso,xgboost,lightgbm,catboost",
+        default="sarimax,lasso,elasticnet,ridge,lstm,xgboost,lightgbm,catboost,random_forest",
         help="仅在 --model auto 时生效，逗号分隔的候选模型列表。",
     )
     parser.add_argument("--excel", default=None, help="Excel 路径（与 --province 二选一）")
@@ -92,7 +124,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--context-len",
         type=int,
         default=111,
-        help="SARIMAX/Lasso 使用的固定历史窗口长度；可先由 TimesFM 实验结果确定后传入",
+        help="SARIMAX/Lasso/ElasticNet/Ridge/LSTM/树模型/随机森林使用的固定历史窗口长度；可先由 TimesFM 实验结果确定后传入",
     )
     return parser
 

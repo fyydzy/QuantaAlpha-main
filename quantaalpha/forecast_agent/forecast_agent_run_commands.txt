@@ -9,8 +9,6 @@ $env:SETUPTOOLS_SCM_PRETEND_VERSION_FOR_QUANTAALPHA = "0.1.0"
 
 uv run python -m quantaalpha.forecast_agent.cli --model auto --province 河北 --as-of-month 2025-06 --test-start 2025-11 --test-end 2026-03 --context-len 63 --selection-metric mape --output-dir "forecast_agent_output/河北"
 
-# 可选：确认 timesfm 已安装
-# uv pip install timesfm
 
 # ---- 显式指定 Excel 路径：TimesFM 搜索 context_len ----
 uv run python -m quantaalpha.forecast_agent.cli --model timesfm --excel "data/processed_data/河北.xlsx" --as-of-month 2025-06 --test-start 2025-11 --test-end 2026-03 --timesfm-device cpu --selection-metric mape --output-dir "forecast_agent_output/河北"
