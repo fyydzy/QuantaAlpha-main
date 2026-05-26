@@ -54,7 +54,9 @@ def _torch_modules():
         import torch.nn as nn
         from torch.utils.data import DataLoader, TensorDataset
     except ImportError as exc:  # pragma: no cover
-        raise ImportError("LSTM 后端需要安装 torch：pip install torch") from exc
+        raise ImportError(
+            "LSTM 需要 PyTorch。请在项目根目录执行: uv sync --extra forecast"
+        ) from exc
     return torch, nn, DataLoader, TensorDataset
 
 

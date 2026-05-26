@@ -209,7 +209,23 @@ FACTOR_CoSTEER_DATA_FOLDER_DEBUG=/your/custom/path/factor_source_data_debug
 
 The experiment will automatically mine, evolve, and validate alpha factors, and save all discovered factors to `all_factors_library*.json`.
 
-### 5. Independent Backtesting
+### 5. Gas Sales Forecast (optional, separate from factor mining)
+
+Decadal gas sales forecasting uses provincial Excel under `data/processed_data/` (column `date` = period start day). This pipeline is independent of `quantaalpha mine`.
+
+```bash
+# Recommended
+quantaalpha forecast --config configs/forecast.yaml
+
+# Or use the helper script
+./run_forecast.sh --model lasso --province 河北
+
+# Optional deps (includes LSTM/torch): uv sync --extra forecast
+```
+
+See [docs/forecast.md](docs/forecast.md)（含 CLI、依赖与 **Web UI** 安装/启动命令）.
+
+### 6. Independent Backtesting
 
 After mining, combine factors from the library for a full-period backtest:
 

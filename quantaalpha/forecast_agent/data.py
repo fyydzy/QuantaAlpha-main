@@ -249,7 +249,9 @@ def normalize_period_column(df: pd.DataFrame, col: str = MONTH_COL) -> pd.DataFr
 
 def find_processed_excel(province: str | None = None) -> str:
     prov = PROCESSED_PROVINCE if province is None else province
+    data_root = os.environ.get("FORECAST_DATA_DIR", "data/processed_data")
     candidates = [
+        os.path.join(data_root, f"{prov}.xlsx"),
         os.path.join("data", "processed_data", f"{prov}.xlsx"),
         os.path.join("processed_data", f"{prov}.xlsx"),
     ]

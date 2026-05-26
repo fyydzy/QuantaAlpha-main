@@ -4,6 +4,7 @@ QuantaAlpha CLI entry.
 Commands:
   quantaalpha mine       - run factor mining
   quantaalpha backtest   - run backtest
+  quantaalpha forecast   - run gas sales decadal forecast
   quantaalpha ui         - start log Web UI
   quantaalpha health_check - environment health check
 """
@@ -26,11 +27,19 @@ from quantaalpha.app.utils.health_check import health_check
 from quantaalpha.app.utils.info import collect_info
 
 
+def forecast(**kwargs):
+    """旬度燃气销量预测（与 mine 并列，不接入因子挖掘循环）。"""
+    from quantaalpha.forecast_agent.runner import forecast_from_fire
+
+    return forecast_from_fire(**kwargs)
+
+
 def app():
     fire.Fire(
         {
             "mine": mine,
             "backtest": backtest,
+            "forecast": forecast,
             "health_check": health_check,
             "collect_info": collect_info,
         }

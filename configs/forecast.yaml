@@ -1,0 +1,18 @@
+# 燃气旬度预测默认配置（CLI: quantaalpha forecast --config configs/forecast.yaml）
+
+data:
+  province: 河北
+  excel_path: null
+
+output_dir: forecast_agent_output/{province}
+
+as_of_month: "2025-06-21"
+test_start: "2025-11-01"
+test_end: "2026-03-21"
+
+model: auto
+candidate_models: sarimax,lasso,elasticnet,ridge,lstm,xgboost,lightgbm,catboost,random_forest
+
+context_len: 270
+selection_metric: mape
+timesfm_device: cpu

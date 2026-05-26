@@ -158,6 +158,38 @@ export async function cancelBacktest(taskId: string) {
   return request(`/api/v1/backtest/${taskId}`, { method: 'DELETE' });
 }
 
+// ========================== Forecast API ==========================
+
+export interface ForecastStartParams {
+  model?: string;
+  province?: string;
+  excel?: string;
+  asOfMonth?: string;
+  testStart?: string;
+  testEnd?: string;
+  outputDir?: string;
+  contextLen?: number;
+  candidateModels?: string;
+  configPath?: string;
+  selectionMetric?: string;
+  timesfmDevice?: string;
+}
+
+export async function startForecast(params: ForecastStartParams) {
+  return request<{ taskId: string; task: Task }>('/api/v1/forecast/start', {
+    method: 'POST',
+    body: JSON.stringify(params),
+  });
+}
+
+export async function getForecastStatus(taskId: string) {
+  return request<{ task: Task }>(`/api/v1/forecast/${taskId}`);
+}
+
+export async function cancelForecast(taskId: string) {
+  return request(`/api/v1/forecast/${taskId}`, { method: 'DELETE' });
+}
+
 // ========================== System Config API ==========================
 
 export async function getSystemConfig() {

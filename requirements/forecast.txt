@@ -1,0 +1,8 @@
+# 燃气预测 auto 候选模型依赖（含 LSTM；不含 TimesFM）
+openpyxl>=3.1
+scikit-learn>=1.3
+lightgbm>=4.0
+xgboost>=2.0
+catboost>=1.2
+pmdarima>=2.0
+torch>=2.0

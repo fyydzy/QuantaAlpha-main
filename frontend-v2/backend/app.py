@@ -70,6 +70,25 @@ class BacktestStartRequest(BaseModel):
     configPath: Optional[str] = Field(None, description="Path to backtest config")
 
 
+class ForecastStartRequest(BaseModel):
+    """Request to start gas sales decadal forecast."""
+    model: str = Field("auto", description="auto | lasso | lstm | ...")
+    province: Optional[str] = Field("河北", description="Province name for Excel lookup")
+    excel: Optional[str] = Field(None, description="Explicit Excel path")
+    asOfMonth: Optional[str] = Field(None, description="Training cutoff date YYYY-MM-DD")
+    testStart: Optional[str] = Field(None, description="Test start date YYYY-MM-DD")
+    testEnd: Optional[str] = Field(None, description="Test end date YYYY-MM-DD")
+    outputDir: Optional[str] = Field(None, description="Output root directory")
+    contextLen: Optional[int] = Field(270, description="History window in decadal periods")
+    candidateModels: Optional[str] = Field(
+        None,
+        description="Comma-separated models when model=auto",
+    )
+    configPath: Optional[str] = Field(None, description="Path to forecast.yaml")
+    selectionMetric: Optional[str] = Field("mape", description="mape | score")
+    timesfmDevice: Optional[str] = Field("cpu", description="cpu | gpu for timesfm")
+
+
 class SystemConfigUpdate(BaseModel):
     """Partial update to system configuration (.env)."""
     QLIB_DATA_DIR: Optional[str] = None
@@ -1073,6 +1092,268 @@ def _load_backtest_results(task: Dict[str, Any]):
     except Exception as e:
         import traceback
         traceback.print_exc()  # print for debugging, but don't crash
+
+
+# ---- Forecast endpoints ----
+
+@app.post("/api/v1/forecast/start", response_model=ApiResponse)
+async def start_forecast(req: ForecastStartRequest):
+    """Start gas sales decadal forecast."""
+    task_id = _gen_id()
+    config_path = req.configPath or str(PROJECT_ROOT / "configs" / "forecast.yaml")
+    output_dir = req.outputDir or f"forecast_agent_output/{req.province or '河北'}"
+
+    task = {
+        "taskId": task_id,
+        "status": "running",
+        "type": "forecast",
+        "config": {**req.model_dump(), "configPath": config_path, "outputDir": output_dir},
+        "progress": {
+            "phase": "forecasting",
+            "currentRound": 0,
+            "totalRounds": 1,
+            "progress": 0,
+            "message": "正在启动燃气预测...",
+            "timestamp": _now(),
+        },
+        "logs": [],
+        "metrics": {},
+        "result": None,
+        "pid": None,
+        "createdAt": _now(),
+        "updatedAt": _now(),
+    }
+    tasks[task_id] = task
+    asyncio.create_task(_run_forecast(task_id, req, config_path, output_dir))
+    return ApiResponse(
+        success=True,
+        data={"taskId": task_id, "task": task},
+        message="燃气预测已启动",
+    )
+
+
+@app.get("/api/v1/forecast/{task_id}", response_model=ApiResponse)
+async def get_forecast_status(task_id: str):
+    if task_id not in tasks:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return ApiResponse(success=True, data={"task": tasks[task_id]})
+
+
+@app.delete("/api/v1/forecast/{task_id}", response_model=ApiResponse)
+async def cancel_forecast(task_id: str):
+    if task_id not in tasks:
+        raise HTTPException(status_code=404, detail="Task not found")
+    task = tasks[task_id]
+    if task.get("pid"):
+        try:
+            os.kill(task["pid"], signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    task["status"] = "cancelled"
+    task["updatedAt"] = _now()
+    await _broadcast(task_id, {
+        "type": "result",
+        "taskId": task_id,
+        "data": {"status": "cancelled"},
+        "timestamp": _now(),
+    })
+    return ApiResponse(success=True, message="燃气预测已取消")
+
+
+async def _run_forecast(
+    task_id: str,
+    req: ForecastStartRequest,
+    config_path: str,
+    output_dir: str,
+):
+    task = tasks[task_id]
+    try:
+        env = os.environ.copy()
+        env.update(_load_dotenv_dict())
+
+        dotenv = _load_dotenv_dict()
+        conda_env = dotenv.get("CONDA_ENV_NAME", "quantaalpha")
+        python_bin = sys.executable
+        for prefix in [
+            os.path.expanduser(f"~/.conda/envs/{conda_env}"),
+        ]:
+            candidate = os.path.join(prefix, "bin", "python")
+            if os.path.isfile(candidate):
+                python_bin = candidate
+                break
+            candidate_win = os.path.join(prefix, "python.exe")
+            if os.path.isfile(candidate_win):
+                python_bin = candidate_win
+                break
+
+        cmd = [
+            python_bin,
+            "-m",
+            "quantaalpha.forecast_agent.cli",
+            "--config",
+            config_path,
+            "--model",
+            req.model,
+            "--output-dir",
+            output_dir,
+        ]
+        if req.province:
+            cmd.extend(["--province", req.province])
+        if req.excel:
+            cmd.extend(["--excel", req.excel])
+        if req.asOfMonth:
+            cmd.extend(["--as-of-month", req.asOfMonth])
+        if req.testStart:
+            cmd.extend(["--test-start", req.testStart])
+        if req.testEnd:
+            cmd.extend(["--test-end", req.testEnd])
+        if req.contextLen is not None:
+            cmd.extend(["--context-len", str(req.contextLen)])
+        if req.candidateModels:
+            cmd.extend(["--candidate-models", req.candidateModels])
+        if req.selectionMetric:
+            cmd.extend(["--selection-metric", req.selectionMetric])
+        if req.timesfmDevice:
+            cmd.extend(["--timesfm-device", req.timesfmDevice])
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            cwd=str(PROJECT_ROOT),
+            env=env,
+        )
+        task["pid"] = proc.pid
+
+        while True:
+            line_bytes = await proc.stdout.readline()
+            if not line_bytes:
+                break
+            line = line_bytes.decode("utf-8", errors="replace").rstrip()
+            if not line:
+                continue
+
+            level = "info"
+            if "ERROR" in line or "Error" in line:
+                level = "error"
+            elif "WARNING" in line:
+                level = "warning"
+            elif "完成" in line or "success" in line.lower():
+                level = "success"
+
+            log_entry = {
+                "id": _gen_id(),
+                "timestamp": _now(),
+                "level": level,
+                "message": line[:500],
+            }
+            task["logs"].append(log_entry)
+            if len(task["logs"]) > 2000:
+                task["logs"] = task["logs"][-2000:]
+
+            await _broadcast(task_id, {
+                "type": "log",
+                "taskId": task_id,
+                "data": log_entry,
+                "timestamp": _now(),
+            })
+
+            if any(kw in line for kw in ["forecast", "预测", "MAPE", "RMSE", "backend", "完成"]):
+                task["progress"]["message"] = line[:200]
+                task["progress"]["timestamp"] = _now()
+                await _broadcast(task_id, {
+                    "type": "progress",
+                    "taskId": task_id,
+                    "data": task["progress"],
+                    "timestamp": _now(),
+                })
+
+        exit_code = await proc.wait()
+        task["pid"] = None
+        task["status"] = "completed" if exit_code == 0 else "failed"
+        task["updatedAt"] = _now()
+
+        if exit_code == 0:
+            task["progress"]["phase"] = "completed"
+            task["progress"]["progress"] = 100
+            task["progress"]["message"] = "预测完成"
+            _load_forecast_results(task, output_dir, req.model)
+        else:
+            task["progress"]["message"] = f"预测失败 (exit code: {exit_code})"
+
+        await _broadcast(task_id, {
+            "type": "result",
+            "taskId": task_id,
+            "data": {"status": task["status"], "metrics": task.get("metrics", {})},
+            "timestamp": _now(),
+        })
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        task["status"] = "failed"
+        task["progress"]["message"] = str(e)
+        task["updatedAt"] = _now()
+        await _broadcast(task_id, {
+            "type": "error",
+            "taskId": task_id,
+            "data": {"error": str(e)},
+            "timestamp": _now(),
+        })
+
+
+def _load_forecast_results(task: Dict[str, Any], output_dir: str, model: str):
+    """Load forecast summary JSON and optional forecast curve for the UI."""
+    try:
+        out = Path(output_dir)
+        if not out.is_absolute():
+            out = PROJECT_ROOT / out
+
+        summary_path = out / "forecast_result.json"
+        if not summary_path.exists():
+            summary_path = out / "model_selection_summary.json"
+        if not summary_path.exists() and model and model != "auto":
+            summary_path = out / model / f"{model}_best_summary.json"
+
+        metrics: Dict[str, Any] = {}
+        if summary_path.exists():
+            with open(summary_path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            if raw.get("best_result"):
+                best = raw["best_result"]
+                metrics["best_model"] = raw.get("best_model") or best.get("backend")
+                metrics["test_metrics"] = best.get("test_metrics") or {}
+                metrics["errors"] = raw.get("errors", {})
+                metrics["candidates"] = [
+                    {
+                        "backend": c.get("backend"),
+                        "test_metrics": c.get("test_metrics", {}),
+                    }
+                    for c in raw.get("candidates", [])
+                ]
+            else:
+                metrics["best_model"] = raw.get("best_model") or raw.get("backend")
+                metrics["test_metrics"] = raw.get("test_metrics") or raw.get("raw", {}).get(
+                    "test_metrics", {}
+                )
+
+        best_model = metrics.get("best_model") or model
+        if best_model and best_model != "auto_select":
+            csv_path = out / str(best_model) / f"{best_model}_forecast.csv"
+            if csv_path.exists():
+                import pandas as pd
+
+                df = pd.read_csv(csv_path)
+                if "ds" in df.columns and "yhat" in df.columns:
+                    metrics["forecast_curve"] = [
+                        {"ds": str(r["ds"]), "yhat": float(r["yhat"])}
+                        for r in df.to_dict(orient="records")
+                    ]
+
+        task["metrics"] = metrics
+    except Exception:
+        import traceback
+        traceback.print_exc()
 
 
 # ---- System config endpoints ----
