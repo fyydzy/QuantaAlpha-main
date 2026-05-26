@@ -1,5 +1,8 @@
-# Forecast Agent 常用运行命令（PowerShell）
+# Forecast Agent 常用运行命令（PowerShell，旬度数据）
 # 说明：
+# - Excel 主时间列为 date（旬开始日，如 2016-03-01）；程序会派生 month=YYYY-MM-1/2/3
+# - CLI 时间参数只接受旬开始日 YYYY-MM-DD，不接受 2025-06-3 这类内部旬标签
+# - context_len 表示「旬」的条数（例如 90 旬 ≈ 30 个月）
 # 当前项目若不是完整 git 仓库，uv run 触发 editable 构建时可能因 setuptools-scm 报错；
 # 每次新开终端运行前可先设置下面的环境变量。
 
@@ -7,74 +10,37 @@ cd "E:\4.1\internship2\智能体框架\QuantaAlpha-main"
 
 $env:SETUPTOOLS_SCM_PRETEND_VERSION_FOR_QUANTAALPHA = "0.1.0"
 
-uv run python -m quantaalpha.forecast_agent.cli --model auto --province 河北 --as-of-month 2025-06 --test-start 2025-11 --test-end 2026-03 --context-len 63 --selection-metric mape --output-dir "forecast_agent_output/河北"
+uv run python -m quantaalpha.forecast_agent.cli --model auto --province 河北 --as-of-month 2025-06-21 --test-start 2025-11-01 --test-end 2026-03-21 --context-len 270 --selection-metric mape --output-dir "forecast_agent_output/河北"
 
 
 # ---- 显式指定 Excel 路径：TimesFM 搜索 context_len ----
-uv run python -m quantaalpha.forecast_agent.cli --model timesfm --excel "data/processed_data/河北.xlsx" --as-of-month 2025-06 --test-start 2025-11 --test-end 2026-03 --timesfm-device cpu --selection-metric mape --output-dir "forecast_agent_output/河北"
+uv run python -m quantaalpha.forecast_agent.cli --model timesfm --excel "data/processed_data/河北.xlsx" --as-of-month 2025-06-21 --test-start 2025-11-01 --test-end 2026-03-21 --timesfm-device cpu --selection-metric mape --output-dir "forecast_agent_output/河北"
 
 # ---- 按省份自动查找 Excel ----
-uv run python -m quantaalpha.forecast_agent.cli --model timesfm --province 河北 --as-of-month 2025-06 --test-start 2025-11 --test-end 2026-03 --timesfm-device cpu --selection-metric mape --output-dir "forecast_agent_output/河北"
+uv run python -m quantaalpha.forecast_agent.cli --model timesfm --province 河北 --as-of-month 2025-06-21 --test-start 2025-11-01 --test-end 2026-03-21 --timesfm-device cpu --selection-metric mape --output-dir "forecast_agent_output/河北"
 
-# ---- 按复合 score 选参 ----
-uv run python -m quantaalpha.forecast_agent.cli --model timesfm --province 河北 --as-of-month 2025-06 --test-start 2025-11 --test-end 2026-03 --timesfm-device cpu --selection-metric score --output-dir "forecast_agent_output/河北_score"
+# ---- SARIMAX（固定 context_len，单位：旬）----
+uv run python -m quantaalpha.forecast_agent.cli --model sarimax --province 河北 --as-of-month 2025-06-21 --test-start 2025-11-01 --test-end 2026-03-21 --context-len 270 --selection-metric mape --output-dir "forecast_agent_output/河北"
 
-# ---- SARIMAX（使用 TimesFM 确认后的固定 context_len，不再搜索）----
-# 结果目录：forecast_agent_output/河北/sarimax（CLI 会自动在 output-dir 下追加 --model）
-uv run python -m quantaalpha.forecast_agent.cli --model sarimax --province 河北 --as-of-month 2025-06 --test-start 2025-11 --test-end 2026-03 --context-len 63 --selection-metric mape --output-dir "forecast_agent_output/河北"
+# ---- Lasso ----
+uv run python -m quantaalpha.forecast_agent.cli --model lasso --province 河北 --as-of-month 2025-06-21 --test-start 2025-11-01 --test-end 2026-03-21 --context-len 270 --selection-metric mape --output-dir "forecast_agent_output/河北"
 
-# ---- Lasso（同上 context_len）；结果目录：forecast_agent_output/河北/lasso ----
-uv run python -m quantaalpha.forecast_agent.cli --model lasso --province 河北 --as-of-month 2025-06 --test-start 2025-11 --test-end 2026-03 --context-len 63 --selection-metric mape --output-dir "forecast_agent_output/河北"
-
-# ---- 自动比选（一次跑 sarimax + lasso，并按 selection-metric 选最优）----
-# 汇总文件：forecast_agent_output/河北/model_selection_summary.json
-uv run python -m quantaalpha.forecast_agent.cli --model auto --candidate-models sarimax,lasso --province 河北 --as-of-month 2025-06 --test-start 2025-11 --test-end 2026-03 --context-len 63 --selection-metric mape --output-dir "forecast_agent_output/河北"
+# ---- 自动比选 ----
+uv run python -m quantaalpha.forecast_agent.cli --model auto --candidate-models sarimax,lasso --province 河北 --as-of-month 2025-06-21 --test-start 2025-11-01 --test-end 2026-03-21 --context-len 270 --selection-metric mape --output-dir "forecast_agent_output/河北"
 
 # =============================================================================
-# 参数说明
+# 参数说明（旬度）
 # =============================================================================
-#
-# --excel
-#   Excel 文件路径；与 --province 二选一。
-#
-# --model
-#   选择模型后端：auto / timesfm / sarimax / lasso。
-#
-# --candidate-models
-#   仅在 --model auto 时生效，逗号分隔候选模型（如 sarimax,lasso）；
-#   程序会运行所有候选，并按 --selection-metric 自动选最优模型。
-#
-# --province
-#   按省份名自动拼路径：data/processed_data/{省份}.xlsx
 #
 # --as-of-month
-#   训练数据截止月（YYYY-MM）；缺省则用 data 模块常量 AS_OF_MONTH。
+#   训练截止旬开始日，格式 YYYY-MM-DD；CLI 参数名未改，语义为旬
 #
 # --test-start / --test-end
-#   测试区间（YYYY-MM）。程序会预测 as_of 后到 test_end 的所有月份；
-#   as_of 与 test_start 之间的月份是 bridge，只输出预测，不参与选参指标；
-#   test_start 到 test_end 的月份用真实值计算指标；TimesFM 会据此选择最优 context_len。
-#
-# --timesfm-device
-#   TimesFM 推理设备：cpu 或 gpu；--model sarimax 时忽略。
-#
-# --selection-metric
-#   TimesFM 选参依据：mape 或 score（0.7*SMAPE + 0.3*RMSE 项）；
-#   SARIMAX 不再搜索 context_len，该参数仅用于记录/兼容单次评估输出。
+#   测试旬区间；as_of 与 test_start 之间为 bridge，只预测不参与选参
 #
 # --context-len
-#   SARIMAX 使用的固定历史窗口长度。建议先运行 TimesFM，取其 best_params.context_len 后传入。
+#   历史窗口长度（旬数）。原月度 90 月约等于旬度 270 旬
 #
-# --output-dir
-#   结果输出根目录；每个模型写入「此目录/<model>/」，例如 forecast_agent_output/河北/timesfm 与 …/sarimax、…/lasso 互不混杂；
-#   当 --model auto 时还会额外输出此目录/model_selection_summary.json。
-#
-# ---- TimesFM 与 freq（代码行为，无独立命令行开关）----
-# TimesFM 调用里 freq 固定为 2；normalize/log_transform 固定为 False；
-# 自动搜索仅在 context_len 上做网格枚举。
-#
-# ---- SARIMAX 与外生变量（代码行为，无独立命令行开关）----
-# SARIMAX 使用 avg_temp/max_temp/min_temp/HDD/extreme_cold_days/temp_range 作为外生变量；
-# 其中 HDD/extreme_cold_days 来自底层日度聚合，temp_range 由 max_temp - min_temp 生成；
-# 输入 Excel 必须包含 month/gas_sales/avg_temp/max_temp/min_temp/HDD/extreme_cold_days；
-# SARIMAX 只运行 --context-len 指定的一组参数，不再网格搜索 context_len。
+# 特征说明：
+# - 同比滞后为 Lag_36（12 月 × 3 旬/月）
+# - LSTM 使用 Lag_36、HDD、is_heating_season

@@ -16,14 +16,18 @@ from sklearn.preprocessing import StandardScaler
 from quantaalpha.forecast_agent.data import (
     MONTH_COL,
     TARGET_COL,
+    MIN_HISTORY_PERIODS,
     TaskContext,
     build_result_table,
     compute_score_metrics,
     forecast_metrics,
     format_month_ds_for_display,
+    filter_periods_in,
+    filter_through_period,
+    load_tabular_feature_frame,
     load_task_context,
+    tabular_feature_columns,
 )
-from quantaalpha.forecast_agent.feature_engineering import WEATHER_INPUT_COLS, build_features_pipeline
 from quantaalpha.forecast_agent.framework import (
     ForecastAgent,
     ForecastEvaluator,
@@ -69,25 +73,13 @@ def _build_feedback_message(metrics: dict[str, float], params: RidgeHyperParams)
         notes.append("测试集误差较高")
     if abs(metrics["bias"]) > max(metrics["mae"] * 0.2, 1.0):
         notes.append("预测存在系统性偏差")
-    if params.context_len < 24:
+    if params.context_len < MIN_HISTORY_PERIODS:
         notes.append("上下文长度偏短")
     return "；".join(notes) if notes else "Ridge 当前配置较稳定"
 
 
 def _load_feature_frame(path: str) -> pd.DataFrame:
-    raw = pd.read_excel(path)
-    required = {MONTH_COL, TARGET_COL, *WEATHER_INPUT_COLS}
-    missing = required - set(raw.columns)
-    if missing:
-        raise ValueError(f"文件缺少 Ridge 所需列: {sorted(missing)}")
-
-    out = raw[list(required)].copy()
-    out[MONTH_COL] = out[MONTH_COL].astype(str).str.slice(0, 7)
-    numeric_cols = [TARGET_COL, *WEATHER_INPUT_COLS]
-    for col in numeric_cols:
-        out[col] = pd.to_numeric(out[col], errors="coerce")
-    out = out.dropna(subset=numeric_cols).sort_values(MONTH_COL).reset_index(drop=True)
-    return build_features_pipeline(out, target_col=TARGET_COL, month_col=MONTH_COL, dropna=True)
+    return load_tabular_feature_frame(path)
 
 
 def _apply_context_window(df: pd.DataFrame, context_len: int) -> pd.DataFrame:
@@ -104,17 +96,20 @@ def _prepare_train_and_future(
     as_of = str(ctx.metadata["as_of_month"])
     feature_df = _load_feature_frame(path)
 
-    train_df = feature_df[feature_df[MONTH_COL] <= as_of].sort_values(MONTH_COL)
+    train_df = filter_through_period(feature_df, as_of)
     train_df = _apply_context_window(train_df, params.context_len)
-    if len(train_df) < 24:
-        raise ValueError(f"context={params.context_len} 样本仅 {len(train_df)} 月，少于 24 月")
+    if len(train_df) < MIN_HISTORY_PERIODS:
+        raise ValueError(
+            f"context={params.context_len} 样本仅 {len(train_df)} 旬，"
+            f"少于 {MIN_HISTORY_PERIODS} 旬（约 24 个月）"
+        )
 
-    future_df = feature_df[feature_df[MONTH_COL].isin(ctx.forecast_months)].sort_values(MONTH_COL)
+    future_df = filter_periods_in(feature_df, ctx.forecast_months)
     if len(future_df) != len(ctx.forecast_months):
         missing = sorted(set(ctx.forecast_months) - set(future_df[MONTH_COL].astype(str)))
-        raise ValueError(f"Ridge 特征月份不完整，缺少: {missing}")
+        raise ValueError(f"Ridge 特征旬不完整，缺少: {missing}")
 
-    feature_cols = [c for c in feature_df.columns if c not in {MONTH_COL, TARGET_COL}]
+    feature_cols = tabular_feature_columns(feature_df)
     return train_df, future_df, feature_cols
 
 

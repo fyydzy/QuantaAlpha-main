@@ -15,14 +15,17 @@ from sklearn.preprocessing import StandardScaler
 from quantaalpha.forecast_agent.data import (
     MONTH_COL,
     TARGET_COL,
+    MIN_HISTORY_PERIODS,
     TaskContext,
     build_result_table,
     compute_score_metrics,
     forecast_metrics,
     format_month_ds_for_display,
+    filter_through_period,
+    load_tabular_feature_frame,
     load_task_context,
+    period_to_lstm_slot,
 )
-from quantaalpha.forecast_agent.feature_engineering import WEATHER_INPUT_COLS, build_features_pipeline
 from quantaalpha.forecast_agent.framework import (
     ForecastAgent,
     ForecastEvaluator,
@@ -34,7 +37,7 @@ from quantaalpha.forecast_agent.framework import (
 )
 
 # ---------- 与 run_lstm_0 一致 ----------
-SELECTED_FEATURES = ["Lag_12", "HDD", "is_heating_season"]
+SELECTED_FEATURES = ["Lag_36", "HDD", "is_heating_season"]
 SEQ_LENGTH = 3
 HIDDEN_SIZE = 16
 NUM_LAYERS = 1
@@ -74,7 +77,7 @@ def _build_lstm_module_class():
             super().__init__()
             self.hidden_size = hidden_size
             self.num_layers = num_layers
-            self.month_emb = nn.Embedding(num_embeddings=13, embedding_dim=emb_dim)
+            self.month_emb = nn.Embedding(num_embeddings=12 * 3, embedding_dim=emb_dim)
             total_input_size = continuous_size + emb_dim
             self.lstm = nn.LSTM(
                 input_size=total_input_size,
@@ -116,26 +119,14 @@ def _build_feedback_message(metrics: dict[str, float], params: LstmHyperParams) 
         notes.append("测试集误差较高")
     if abs(metrics["bias"]) > max(metrics["mae"] * 0.2, 1.0):
         notes.append("预测存在系统性偏差")
-    if params.context_len < 24:
+    if params.context_len < MIN_HISTORY_PERIODS:
         notes.append("上下文长度偏短")
     return "；".join(notes) if notes else "LSTM 当前配置较稳定"
 
 
 def _load_feature_frame(path: str) -> pd.DataFrame:
-    raw = pd.read_excel(path)
-    required = {MONTH_COL, TARGET_COL, *WEATHER_INPUT_COLS}
-    missing = required - set(raw.columns)
-    if missing:
-        raise ValueError(f"文件缺少 LSTM 所需列: {sorted(missing)}")
-
-    out = raw[list(required)].copy()
-    out[MONTH_COL] = out[MONTH_COL].astype(str).str.slice(0, 7)
-    numeric_cols = [TARGET_COL, *WEATHER_INPUT_COLS]
-    for col in numeric_cols:
-        out[col] = pd.to_numeric(out[col], errors="coerce")
-    out = out.dropna(subset=numeric_cols).sort_values(MONTH_COL).reset_index(drop=True)
-    df_features = build_features_pipeline(out, target_col=TARGET_COL, month_col=MONTH_COL, dropna=True)
-    df_features["month_idx"] = pd.to_datetime(df_features[MONTH_COL].astype(str)).dt.month.astype(np.int64)
+    df_features = load_tabular_feature_frame(path)
+    df_features["period_slot"] = df_features[MONTH_COL].astype(str).map(period_to_lstm_slot).astype(np.int64)
     return df_features
 
 
@@ -157,16 +148,17 @@ def _prepare_lstm_frames(
         raise ValueError(f"特征工程后缺少 LSTM 所需特征: {missing_features}")
 
     as_of = str(ctx.metadata["as_of_month"])
-    train_ctx = feature_df[feature_df[MONTH_COL] <= as_of].sort_values(MONTH_COL)
+    train_ctx = filter_through_period(feature_df, as_of)
     train_ctx = _apply_context_window(train_ctx, params.context_len)
-    if len(train_ctx) < max(24, SEQ_LENGTH + 2):
+    min_periods = max(MIN_HISTORY_PERIODS, SEQ_LENGTH + 2)
+    if len(train_ctx) < min_periods:
         raise ValueError(
-            f"context={params.context_len} 训练月数 {len(train_ctx)}，"
-            f"需至少 max(24, SEQ_LENGTH+2)={max(24, SEQ_LENGTH + 2)} 月",
+            f"context={params.context_len} 训练旬数 {len(train_ctx)}，"
+            f"需至少 {min_periods} 旬",
         )
 
     max_fc = max(ctx.forecast_months)
-    work_df = feature_df[feature_df[MONTH_COL] <= max_fc].sort_values(MONTH_COL).reset_index(drop=True)
+    work_df = filter_through_period(feature_df, max_fc).reset_index(drop=True)
     if len(work_df) < SEQ_LENGTH + len(ctx.forecast_months):
         raise ValueError("work_df 过短，无法构造预测序列。")
 
@@ -204,8 +196,8 @@ def _train_lstm(
     forecast_months: list[str],
 ) -> tuple[Any, StandardScaler, StandardScaler, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """与随机森林一致：仅使用 as_of 之后再经 context_len 截窗的 train_ctx。
-    StandardScaler 仅在 train_ctx 所含月份对应的行上 fit；LSTM 仅用「预测目标月落在 train_ctx」的序列做训练。
-    work_df 仍可包含更早月份，仅为构造 SEQ_LENGTH 输入与预测未来月所需。"""
+    StandardScaler 仅在 train_ctx 所含旬对应的行上 fit；LSTM 仅用「预测目标旬落在 train_ctx」的序列做训练。
+    work_df 仍可包含更早旬，仅为构造 SEQ_LENGTH 输入与预测未来旬所需。"""
     torch, nn, DataLoader, TensorDataset = _torch_modules()
     LSTMCls = _build_lstm_module_class()
 
@@ -214,12 +206,12 @@ def _train_lstm(
 
     month_arr = work_df[MONTH_COL].astype(str).to_numpy()
     x_cont_all = work_df[SELECTED_FEATURES].to_numpy(dtype=float)
-    x_month_all = work_df["month_idx"].to_numpy(dtype=np.int64)
+    x_month_all = work_df["period_slot"].to_numpy(dtype=np.int64)
     y_all = work_df[TARGET_COL].to_numpy(dtype=float)
 
     train_month_mask = work_df[MONTH_COL].astype(str).isin(train_ctx[MONTH_COL].astype(str)).to_numpy()
     if not np.any(train_month_mask):
-        raise ValueError("work_df 中找不到 train_ctx 对应月份。")
+        raise ValueError("work_df 中找不到 train_ctx 对应旬。")
 
     scaler_x = StandardScaler()
     scaler_y = StandardScaler()
@@ -311,7 +303,7 @@ def _predict_future(
     ordered: list[float] = []
     for m in forecast_months:
         if m not in month_to_pred:
-            raise ValueError(f"LSTM 预测缺少月份: {m}")
+            raise ValueError(f"LSTM 预测缺少旬: {m}")
         ordered.append(month_to_pred[m])
     return np.asarray(ordered, dtype=float)
 
@@ -452,7 +444,7 @@ class AutoLstmForecastAgent(ForecastAgent):
             model.load_state_dict(state_d)
             month_arr = work_df[MONTH_COL].astype(str).to_numpy()
             x_cont_all = work_df[SELECTED_FEATURES].to_numpy(dtype=float)
-            x_month_all = work_df["month_idx"].to_numpy(dtype=np.int64)
+            x_month_all = work_df["period_slot"].to_numpy(dtype=np.int64)
             y_all = work_df[TARGET_COL].to_numpy(dtype=float)
             x_cont_scaled = scaler_x.transform(x_cont_all)
             y_scaled = scaler_y.transform(y_all.reshape(-1, 1)).flatten()

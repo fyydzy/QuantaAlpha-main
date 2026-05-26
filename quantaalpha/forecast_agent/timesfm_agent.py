@@ -1,10 +1,10 @@
 """TimesFM 预测后端。
 
-当前流程固定为月度 Excel 数据：
+当前流程固定为旬度 Excel 数据：
 
-1. 使用 ``as_of_month`` 及以前的数据作为训练序列；
-2. 一次性预测 bridge + test 月份；
-3. 仅用 test 月份真实值计算指标，并据此选择最优 ``context_len``。
+1. 使用 ``as_of_month`` 指定的旬开始日及以前的数据作为训练序列；
+2. 一次性预测 bridge + test 各旬；
+3. 仅用 test 区间真实值计算指标，并据此选择最优 ``context_len``。
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 
 from quantaalpha.forecast_agent.data import (
+    MIN_HISTORY_PERIODS,
     TaskContext,
     build_result_table,
     compute_score_metrics,
@@ -69,7 +70,7 @@ def _build_feedback_message(metrics: dict[str, float], params: TimesFmHyperParam
         notes.append("测试集误差较高")
     if abs(metrics["bias"]) > max(metrics["mae"] * 0.2, 1.0):
         notes.append("预测存在系统性偏差")
-    if params.context_len < 24:
+    if params.context_len < MIN_HISTORY_PERIODS:
         notes.append("上下文长度偏短")
     return "；".join(notes) if notes else "TimesFM 当前配置较稳定"
 
@@ -153,7 +154,7 @@ class TimesFmEvaluator(ForecastEvaluator):
 
     def evaluate(self, task: ForecastTask, subjects: ForecastSubjects) -> ForecastFeedback:
         ctx = load_task_context(task)
-        if len(ctx.series) < 12:
+        if len(ctx.series) < MIN_HISTORY_PERIODS:
             return _failed_feedback("训练样本太短，无法评估 TimesFM 参数")
 
         params: TimesFmHyperParams = subjects.params  # type: ignore[assignment]

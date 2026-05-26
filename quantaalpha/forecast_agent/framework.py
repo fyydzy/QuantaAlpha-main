@@ -19,10 +19,11 @@ class HyperParamsLike(Protocol):
 
 @dataclass
 class ForecastTask:
-    """月度燃气预测任务。
+    """旬度燃气预测任务。
 
-    使用 ``as_of_month`` 及以前的数据训练，并预测 bridge + test 月份；
-    测试区间由 ``test_start`` / ``test_end`` 指定。
+    Excel 主时间列为 ``date``，值为每旬开始日（每月 1/11/21 日）。
+    使用 ``as_of_month`` 指定的旬开始日及以前的数据训练，并预测 bridge + test 各旬；
+    测试区间由 ``test_start`` / ``test_end`` 的旬开始日指定。
     """
 
     output_dir: Path = Path("forecast_agent_output")

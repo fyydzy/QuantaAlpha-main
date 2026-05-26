@@ -65,7 +65,7 @@ MODEL_FACTORIES: dict[str, ModelFactory] = {
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="月度 Excel 燃气数据预测（预留多模型入口）。",
+        description="旬度 Excel 燃气数据预测（预留多模型入口）。",
     )
     parser.add_argument(
         "--model",
@@ -99,10 +99,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--as-of-month",
         default=None,
-        help="训练截止月 YYYY-MM；缺省见 data.AS_OF_MONTH",
+        help="训练截止旬开始日 YYYY-MM-DD（如 2025-06-21）；缺省见 data.AS_OF_DATE",
     )
-    parser.add_argument("--test-start", default=None, help="测试起始 YYYY-MM")
-    parser.add_argument("--test-end", default=None, help="测试结束 YYYY-MM")
+    parser.add_argument("--test-start", default=None, help="测试起始旬开始日 YYYY-MM-DD")
+    parser.add_argument("--test-end", default=None, help="测试结束旬开始日 YYYY-MM-DD")
     parser.add_argument(
         "--output-dir",
         default="forecast_agent_output",
@@ -124,7 +124,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--context-len",
         type=int,
         default=111,
-        help="SARIMAX/Lasso/ElasticNet/Ridge/LSTM/树模型/随机森林使用的固定历史窗口长度；可先由 TimesFM 实验结果确定后传入",
+        help="各模型使用的固定历史窗口长度（旬数，非月数）；可先由 TimesFM 实验结果确定后传入",
     )
     return parser
 
