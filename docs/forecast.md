@@ -225,6 +225,4 @@ result = run_forecast(ForecastRunConfig(
 ))
 ```
 
-## 已废弃
 
-根目录 [`forecast_agent_0/`](../forecast_agent_0/) 为早期原型，请使用 `uv run quantaalpha forecast` 或上文 Web UI。
