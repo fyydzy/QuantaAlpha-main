@@ -226,3 +226,11 @@ result = run_forecast(ForecastRunConfig(
 ```
 
 
+```bash
+## 切换分支
+git checkout test1
+## 创建新分支
+git checkout -b mine
+## 推上云端
+git push -u origin mine
+```
