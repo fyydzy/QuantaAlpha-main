@@ -7544,6 +7544,7 @@ forecast = [
     { name = "pmdarima" },
     { name = "scikit-learn", version = "1.7.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "scikit-learn", version = "1.8.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "torch" },
     { name = "xgboost" },
 ]
 forecast-all = [
@@ -7601,6 +7602,7 @@ requires-dist = [
     { name = "sphinx-togglebutton", marker = "extra == 'docs'" },
     { name = "tables" },
     { name = "tiktoken" },
+    { name = "torch", marker = "extra == 'forecast'", specifier = ">=2.0" },
     { name = "torch", marker = "extra == 'forecast-all'", specifier = ">=2.0" },
     { name = "xgboost", marker = "extra == 'forecast'", specifier = ">=2.0" },
     { name = "xgboost", marker = "extra == 'forecast-all'", specifier = ">=2.0" },

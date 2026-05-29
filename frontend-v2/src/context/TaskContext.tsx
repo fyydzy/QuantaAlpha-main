@@ -25,10 +25,13 @@ import {
   startForecast as apiStartForecast,
   getForecastStatus,
   cancelForecast as apiCancelForecast,
+  startForecastSearch as apiStartForecastSearch,
+  getForecastSearchStatus,
+  cancelForecastSearch as apiCancelForecastSearch,
   connectMiningWs,
   healthCheck,
 } from '@/services/api';
-import type { BacktestStartParams, ForecastStartParams } from '@/services/api';
+import type { BacktestStartParams, ForecastStartParams, ForecastSearchStartParams } from '@/services/api';
 import { getDefaultMiningDirection } from '@/utils/miningDirections';
 
 // ========================== Backtest local type ==========================
@@ -75,6 +78,12 @@ interface TaskContextValue {
   forecastLogs: LogEntry[];
   startForecastTask: (params: ForecastStartParams) => Promise<void>;
   stopForecastTask: () => void;
+
+  // ---- Forecast Search ----
+  forecastSearchTask: BacktestTask | null;
+  forecastSearchLogs: LogEntry[];
+  startForecastSearchTask: (params: ForecastSearchStartParams) => Promise<void>;
+  stopForecastSearchTask: () => void;
 }
 
 const TaskContext = createContext<TaskContextValue | null>(null);
@@ -696,6 +705,117 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
   }, [forecastTask]);
 
   // ==================================================================
+  // FORECAST SEARCH
+  // ==================================================================
+  const [forecastSearchTask, setForecastSearchTask] = useState<BacktestTask | null>(null);
+  const [forecastSearchLogs, setForecastSearchLogs] = useState<LogEntry[]>([]);
+  const forecastSearchWsRef = useRef<WebSocket | null>(null);
+  const forecastSearchPollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const handleForecastSearchWsMessage = useCallback((msg: WsMessage) => {
+    switch (msg.type) {
+      case 'progress':
+        setForecastSearchTask((prev) => {
+          if (!prev) return prev;
+          return { ...prev, progress: msg.data, updatedAt: new Date().toISOString() };
+        });
+        break;
+      case 'log':
+        setForecastSearchLogs((l) => [...l.slice(-499), msg.data as LogEntry]);
+        break;
+      case 'metrics':
+        setForecastSearchTask((prev) => {
+          if (!prev) return prev;
+          return { ...prev, metrics: msg.data, updatedAt: new Date().toISOString() };
+        });
+        break;
+      case 'result':
+        setForecastSearchTask((prev) => {
+          if (!prev) return prev;
+          return {
+            ...prev,
+            status: msg.data.status === 'completed' ? 'completed' : 'failed',
+            metrics: msg.data.metrics || prev.metrics,
+            updatedAt: new Date().toISOString(),
+          };
+        });
+        break;
+      case 'error':
+        setForecastSearchTask((prev) => {
+          if (!prev) return prev;
+          return { ...prev, status: 'failed', updatedAt: new Date().toISOString() };
+        });
+        break;
+    }
+  }, []);
+
+  const startForecastSearchTask = useCallback(
+    async (params: ForecastSearchStartParams) => {
+      setForecastSearchLogs([]);
+      const resp = await apiStartForecastSearch(params);
+      if (!resp.success || !resp.data) throw new Error(resp.error || 'Failed');
+
+      const taskData = resp.data.task as unknown as BacktestTask;
+      setForecastSearchTask(taskData);
+
+      const ws = connectMiningWs(
+        resp.data.taskId,
+        handleForecastSearchWsMessage,
+        () => {
+          getForecastSearchStatus(resp.data!.taskId).then((r) => {
+            if (r.data?.task) setForecastSearchTask(r.data.task as unknown as BacktestTask);
+          });
+        },
+      );
+      forecastSearchWsRef.current = ws;
+
+      forecastSearchPollingRef.current = setInterval(async () => {
+        try {
+          const r = await getForecastSearchStatus(resp.data!.taskId);
+          if (r.data?.task) {
+            const t = r.data.task as unknown as BacktestTask;
+            setForecastSearchTask((prev) => {
+              if (!prev) return t;
+              return {
+                ...prev,
+                status: t.status,
+                progress: t.progress || prev.progress,
+                metrics: t.metrics && Object.keys(t.metrics).length > 0 ? t.metrics : prev.metrics,
+                updatedAt: t.updatedAt,
+              };
+            });
+            if (t.status === 'completed' || t.status === 'failed' || t.status === 'cancelled') {
+              setForecastSearchTask(t);
+              if (t.logs?.length) setForecastSearchLogs(t.logs.slice(-500));
+              clearInterval(forecastSearchPollingRef.current!);
+              forecastSearchPollingRef.current = null;
+            }
+          }
+        } catch {
+          // ignore
+        }
+      }, 5000);
+    },
+    [handleForecastSearchWsMessage],
+  );
+
+  const stopForecastSearchTask = useCallback(async () => {
+    if (!forecastSearchTask) return;
+    forecastSearchWsRef.current?.close();
+    forecastSearchWsRef.current = null;
+    if (forecastSearchPollingRef.current) {
+      clearInterval(forecastSearchPollingRef.current);
+      forecastSearchPollingRef.current = null;
+    }
+    try {
+      await apiCancelForecastSearch(forecastSearchTask.taskId);
+    } catch {
+      // ignore
+    }
+    setForecastSearchTask((prev) => (prev ? { ...prev, status: 'cancelled' } : prev));
+  }, [forecastSearchTask]);
+
+  // ==================================================================
   // Context value
   // ==================================================================
   const value: TaskContextValue = {
@@ -719,6 +839,11 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
     forecastLogs,
     startForecastTask,
     stopForecastTask,
+
+    forecastSearchTask,
+    forecastSearchLogs,
+    startForecastSearchTask,
+    stopForecastSearchTask,
   };
 
   return <TaskContext.Provider value={value}>{children}</TaskContext.Provider>;

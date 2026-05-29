@@ -190,6 +190,39 @@ export async function cancelForecast(taskId: string) {
   return request(`/api/v1/forecast/${taskId}`, { method: 'DELETE' });
 }
 
+// ========================== Forecast Search API ==========================
+
+export interface ForecastSearchStartParams {
+  goal: string;
+  province?: string;
+  asOfMonth?: string;
+  testStart?: string;
+  testEnd?: string;
+  outputDir?: string;
+  contextLen?: number;
+  model?: string;
+  numberOfSolutions?: number;
+  maxFeatureCount?: number;
+  requiredFeatures?: string[];
+  configPath?: string;
+  onlyFeedback?: boolean;
+}
+
+export async function startForecastSearch(params: ForecastSearchStartParams) {
+  return request<{ taskId: string; task: Task }>('/api/v1/forecast_search/start', {
+    method: 'POST',
+    body: JSON.stringify(params),
+  });
+}
+
+export async function getForecastSearchStatus(taskId: string) {
+  return request<{ task: Task }>(`/api/v1/forecast_search/${taskId}`);
+}
+
+export async function cancelForecastSearch(taskId: string) {
+  return request(`/api/v1/forecast_search/${taskId}`, { method: 'DELETE' });
+}
+
 // ========================== System Config API ==========================
 
 export async function getSystemConfig() {

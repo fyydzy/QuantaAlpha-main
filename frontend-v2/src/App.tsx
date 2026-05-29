@@ -4,6 +4,7 @@ import { MiningDashboardPage } from '@/pages/MiningDashboardPage';
 import { FactorLibraryPage } from '@/pages/FactorLibraryPage';
 import { BacktestPage } from '@/pages/BacktestPage';
 import { ForecastPage } from '@/pages/ForecastPage';
+import { ForecastSearchPage } from '@/pages/ForecastSearchPage';
 import { SettingsPage } from '@/pages/SettingsPage';
 import { Layout } from '@/components/layout/Layout';
 import type { PageId } from '@/components/layout/Layout';
@@ -53,6 +54,11 @@ const AppContent: React.FC = () => {
       <div style={{ display: currentPage === 'forecast' ? 'block' : 'none' }}>
         <Layout currentPage={currentPage} onNavigate={setCurrentPage}>
           <ForecastPage />
+        </Layout>
+      </div>
+      <div style={{ display: currentPage === 'forecast_search' ? 'block' : 'none' }}>
+        <Layout currentPage={currentPage} onNavigate={setCurrentPage}>
+          <ForecastSearchPage />
         </Layout>
       </div>
       <div style={{ display: currentPage === 'settings' ? 'block' : 'none' }}>
