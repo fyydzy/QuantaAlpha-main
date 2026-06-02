@@ -44,7 +44,27 @@ def parse_forecast_solution_library(raw: str | list[dict[str, Any]] | dict[str, 
     - a Python object already loaded from JSON (array or dict wrapper)
     """
     if isinstance(raw, str):
-        payload = json.loads(raw)
+        text = raw.strip()
+        if not text:
+            raise ValueError("LLM 返回为空，无法解析方案 JSON")
+        # Strip optional markdown fence
+        if text.startswith("```"):
+            lines = text.splitlines()
+            if lines and lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            text = "\n".join(lines).strip()
+        # Array or object
+        if text.lstrip().startswith("["):
+            payload = json.loads(text)
+        else:
+            start = text.find("[")
+            end = text.rfind("]")
+            if start >= 0 and end > start:
+                payload = json.loads(text[start : end + 1])
+            else:
+                payload = json.loads(text)
     else:
         payload = raw
 

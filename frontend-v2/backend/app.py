@@ -1427,6 +1427,45 @@ def _load_forecast_search_results(task: Dict[str, Any], output_dir: str):
             metrics["forecast_feedback_md"] = str(feedback_md)
             metrics["forecast_feedback_md_text"] = feedback_md.read_text(encoding="utf-8", errors="replace")
 
+        fixed_model = "xgboost"
+        if isinstance(metrics.get("solution_library"), dict):
+            fixed_model = str(metrics["solution_library"].get("fixed_model") or fixed_model)
+
+        solution_test_results: Dict[str, Any] = {}
+        for row in metrics.get("leaderboard", []):
+            if not isinstance(row, dict):
+                continue
+            sid = row.get("solution_id")
+            if not sid:
+                continue
+            model_name = str(row.get("model") or fixed_model)
+            out_raw = row.get("output_dir")
+            if out_raw:
+                model_dir = Path(str(out_raw))
+                if not model_dir.is_absolute():
+                    model_dir = PROJECT_ROOT / model_dir
+            else:
+                model_dir = out / "solutions" / str(sid) / model_name
+
+            points = _load_forecast_test_points_for_ui(model_dir, model_name)
+            curve = [
+                {"ds": p["ds"], "yhat": p.get("yhat"), "y": p.get("y")}
+                for p in points
+                if p.get("ds")
+            ]
+            solution_test_results[str(sid)] = {
+                "solution_id": sid,
+                "name": row.get("name"),
+                "model": model_name,
+                "mape": row.get("MAPE"),
+                "rmse": row.get("RMSE"),
+                "r2": row.get("R2"),
+                "curve": curve,
+                "table": points,
+            }
+        if solution_test_results:
+            metrics["solution_test_results"] = solution_test_results
+
         task["metrics"] = metrics
     except Exception:
         import traceback
@@ -1577,12 +1616,8 @@ async def _run_forecast(
         })
 
 
-def _load_forecast_curve_for_ui(model_dir: Path, model_name: str) -> list[dict[str, Any]]:
-    """读取测试集曲线（优先），供前端绘制预测值 vs 真实值。
-
-    - 优先使用 `{model}_test.xlsx/.csv`（包含 phase/test、actual_gas_sales 等），仅返回测试集区间；
-    - 若测试表不存在，则回退到 `{model}_forecast.csv`（仅预测 yhat）。
-    """
+def _load_forecast_test_points_for_ui(model_dir: Path, model_name: str) -> list[dict[str, Any]]:
+    """读取测试集预测点（日期、预测值、真实值），供曲线与表格共用。"""
     import pandas as pd
 
     from quantaalpha.forecast_agent.data import normalize_period, period_to_start_date
@@ -1596,47 +1631,68 @@ def _load_forecast_curve_for_ui(model_dir: Path, model_name: str) -> list[dict[s
     else:
         test_df = None
 
-    # Prefer test table: it already aligns predicted/actual and contains phase.
-    if test_df is not None and {"predicted_gas_sales", "actual_gas_sales"}.issubset(set(test_df.columns)):
-        df = test_df.copy()
-        if "phase" in df.columns:
-            df = df[df["phase"].astype(str).str.lower() == "test"].copy()
-        if df.empty:
-            return []
+    if test_df is None or not {"predicted_gas_sales", "actual_gas_sales"}.issubset(set(test_df.columns)):
+        return []
 
-        def _row_ds(row: pd.Series) -> str | None:
-            if "date" in df.columns and pd.notna(row.get("date")):
-                try:
-                    return pd.Timestamp(row["date"]).strftime("%Y-%m-%d")
-                except Exception:
-                    return None
-            if "month" in df.columns and pd.notna(row.get("month")):
-                try:
-                    return period_to_start_date(normalize_period(row["month"])).strftime("%Y-%m-%d")
-                except Exception:
-                    return None
-            return None
+    df = test_df.copy()
+    if "phase" in df.columns:
+        df = df[df["phase"].astype(str).str.lower() == "test"].copy()
+    if df.empty:
+        return []
 
+    def _row_ds(row: pd.Series) -> str | None:
+        if "date" in df.columns and pd.notna(row.get("date")):
+            try:
+                return pd.Timestamp(row["date"]).strftime("%Y-%m-%d")
+            except Exception:
+                return None
+        if "month" in df.columns and pd.notna(row.get("month")):
+            try:
+                return period_to_start_date(normalize_period(row["month"])).strftime("%Y-%m-%d")
+            except Exception:
+                return None
+        return None
+
+    points: list[dict[str, Any]] = []
+    for _, row in df.iterrows():
+        ds = _row_ds(row)
+        if not ds:
+            continue
+        yhat = row.get("predicted_gas_sales")
+        y = row.get("actual_gas_sales")
+        if pd.isna(yhat) and pd.isna(y):
+            continue
+        period = str(row.get("month", "")) if "month" in df.columns and pd.notna(row.get("month")) else ""
+        point: dict[str, Any] = {"ds": ds, "period": period}
+        if pd.notna(yhat):
+            point["yhat"] = float(yhat)
+        if pd.notna(y):
+            point["y"] = float(y)
+        if pd.notna(yhat) and pd.notna(y) and float(y) != 0:
+            point["error_pct"] = (float(yhat) - float(y)) / float(y) * 100.0
+        points.append(point)
+
+    points.sort(key=lambda p: p.get("ds", ""))
+    return points
+
+
+def _load_forecast_curve_for_ui(model_dir: Path, model_name: str) -> list[dict[str, Any]]:
+    """读取测试集曲线（优先），供前端绘制预测值 vs 真实值。"""
+    points = _load_forecast_test_points_for_ui(model_dir, model_name)
+    if points:
         curve: list[dict[str, Any]] = []
-        for _, row in df.iterrows():
-            ds = _row_ds(row)
-            if not ds:
-                continue
-            yhat = row.get("predicted_gas_sales")
-            y = row.get("actual_gas_sales")
-            if pd.isna(yhat) and pd.isna(y):
-                continue
-            point: dict[str, Any] = {"ds": ds}
-            if pd.notna(yhat):
-                point["yhat"] = float(yhat)
-            if pd.notna(y):
-                point["y"] = float(y)
-            curve.append(point)
-
-        curve.sort(key=lambda p: p.get("ds", ""))
+        for p in points:
+            item: dict[str, Any] = {"ds": p["ds"]}
+            if p.get("yhat") is not None:
+                item["yhat"] = p["yhat"]
+            if p.get("y") is not None:
+                item["y"] = p["y"]
+            curve.append(item)
         return curve
 
     # Fallback: forecast csv (prediction only).
+    import pandas as pd
+
     csv_path = model_dir / f"{model_name}_forecast.csv"
     if not csv_path.exists():
         return []

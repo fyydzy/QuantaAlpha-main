@@ -94,12 +94,27 @@ def _build_prompt(cfg: FeedbackConfig, *, leaderboard_md: str) -> tuple[str, str
 
 
 def _extract_json_object(text: str) -> str:
-    # Best-effort extract first {...} block
+    """Best-effort extract first {...} block from LLM text."""
+    if not text or not str(text).strip():
+        return ""
     start = text.find("{")
     end = text.rfind("}")
     if start >= 0 and end > start:
         return text[start : end + 1]
-    return text
+    return str(text).strip()
+
+
+def _parse_feedback_payload(raw: str) -> dict[str, Any]:
+    snippet = _extract_json_object(raw)
+    if not snippet:
+        raise ValueError("LLM 返回为空或不含 JSON 对象，请检查 API Key / 模型 / 代理是否可用")
+    try:
+        payload = json.loads(snippet)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"LLM 返回不是合法 JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("LLM 返回的 JSON 必须是对象（dict）")
+    return payload
 
 
 def generate_forecast_search_feedback(cfg: FeedbackConfig) -> dict[str, Any]:
@@ -117,18 +132,39 @@ def generate_forecast_search_feedback(cfg: FeedbackConfig) -> dict[str, Any]:
 
     top_k = max(1, int(cfg.top_k))
     df_top = df.head(top_k).copy()
-    leaderboard_md = df_top.to_markdown(index=False)
+    try:
+        leaderboard_md = df_top.to_markdown(index=False)
+    except ImportError:
+        leaderboard_md = df_top.to_csv(index=False)
 
     system_prompt, user_prompt = _build_prompt(cfg, leaderboard_md=leaderboard_md)
 
-    resp = APIBackend().build_messages_and_create_chat_completion(
-        user_prompt=user_prompt,
-        system_prompt=system_prompt,
-        json_mode=True,  # request json_object; APIBackend will extract braces
-        reasoning_flag=False,
-    )
-    resp = _extract_json_object(resp)
-    payload = json.loads(resp)
+    max_attempts = 5
+    last_exc: Exception | None = None
+    payload: dict[str, Any] | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            # Some compatible endpoints do not support response_format=json_object reliably.
+            use_json_mode = attempt <= 2
+            resp = APIBackend().build_messages_and_create_chat_completion(
+                user_prompt=user_prompt,
+                system_prompt=system_prompt,
+                json_mode=use_json_mode,
+                add_json_in_prompt=not use_json_mode,
+                reasoning_flag=False,
+            )
+            payload = _parse_feedback_payload(resp)
+            break
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            logger.warning(f"forecast_feedback LLM parse failed (attempt {attempt}): {exc}")
+            system_prompt = (
+                system_prompt
+                + "\n\n你必须只输出一个严格 JSON 对象，不要 markdown 代码块，不要任何解释文字。"
+            )
+
+    if payload is None:
+        raise RuntimeError(f"LLM 总结生成失败（已重试 {max_attempts} 次）: {last_exc}")
 
     feedback_json_path = _resolve_optional_path(out_root, cfg.feedback_json, paths["feedback_json"])
     feedback_json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")

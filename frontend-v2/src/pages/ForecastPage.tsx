@@ -228,11 +228,23 @@ export const ForecastPage: React.FC = () => {
               橙色为模型预测（含 bridge 与 test）；蓝色为测试区间真实销量（有实测值的旬）。
               {!hasActual && ' 当前结果中暂无真实值，请重新跑预测后刷新。'}
             </p>
-            <div className="h-[280px]">
+            <div className="h-[300px]">
               <ResponsiveContainer width="100%" height="100%">
-                <LineChart data={curve}>
+                <LineChart
+                  data={curve}
+                  margin={{ top: 8, right: 16, left: 8, bottom: 28 }}
+                >
                   <CartesianGrid strokeDasharray="3 3" opacity={0.2} />
-                  <XAxis dataKey="ds" tick={{ fontSize: 10 }} />
+                  <XAxis
+                    dataKey="ds"
+                    tick={{ fontSize: 10 }}
+                    interval={0}
+                    minTickGap={0}
+                    angle={-28}
+                    textAnchor="end"
+                    height={56}
+                    tickFormatter={(v: string) => (v && v.length >= 10 ? v.slice(5) : v)}
+                  />
                   <YAxis tick={{ fontSize: 10 }} />
                   <Tooltip
                     formatter={(value: number, name: string) => [
