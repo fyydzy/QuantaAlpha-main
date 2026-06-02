@@ -17,6 +17,7 @@ import {
   YAxis,
   CartesianGrid,
   Tooltip,
+  Legend,
   ResponsiveContainer,
 } from 'recharts';
 import { useTaskContext } from '@/context/TaskContext';
@@ -81,6 +82,7 @@ export const ForecastPage: React.FC = () => {
   const metrics = task?.metrics || {};
   const testMetrics = metrics.test_metrics || {};
   const curve = metrics.forecast_curve || [];
+  const hasActual = curve.some((p: { y?: number }) => p.y != null && !Number.isNaN(p.y));
 
   return (
     <div className="space-y-6 animate-fade-in-up">
@@ -187,7 +189,7 @@ export const ForecastPage: React.FC = () => {
           </Button>
         )}
         {task?.status && (
-          <Badge variant={task.status === 'completed' ? 'default' : 'secondary'}>{task.status}</Badge>
+          <Badge variant={task.status === 'completed' ? 'default' : 'outline'}>{task.status}</Badge>
         )}
         {metrics.best_model && <Badge variant="outline">最优: {metrics.best_model}</Badge>}
       </div>
@@ -218,18 +220,60 @@ export const ForecastPage: React.FC = () => {
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
               <TrendingUp className="h-5 w-5" />
-              预测曲线
+              预测 vs 真实
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <div className="h-[280px]">
+            <p className="text-xs text-muted-foreground mb-3">
+              橙色为模型预测（含 bridge 与 test）；蓝色为测试区间真实销量（有实测值的旬）。
+              {!hasActual && ' 当前结果中暂无真实值，请重新跑预测后刷新。'}
+            </p>
+            <div className="h-[300px]">
               <ResponsiveContainer width="100%" height="100%">
-                <LineChart data={curve}>
+                <LineChart
+                  data={curve}
+                  margin={{ top: 8, right: 16, left: 8, bottom: 28 }}
+                >
                   <CartesianGrid strokeDasharray="3 3" opacity={0.2} />
-                  <XAxis dataKey="ds" tick={{ fontSize: 10 }} />
+                  <XAxis
+                    dataKey="ds"
+                    tick={{ fontSize: 10 }}
+                    interval={0}
+                    minTickGap={0}
+                    angle={-28}
+                    textAnchor="end"
+                    height={56}
+                    tickFormatter={(v: string) => (v && v.length >= 10 ? v.slice(5) : v)}
+                  />
                   <YAxis tick={{ fontSize: 10 }} />
-                  <Tooltip />
-                  <Line type="monotone" dataKey="yhat" stroke="#f97316" dot={false} />
+                  <Tooltip
+                    formatter={(value: number, name: string) => [
+                      formatNumber(value, 0),
+                      name === 'yhat' ? '预测' : '真实',
+                    ]}
+                  />
+                  <Legend
+                    formatter={(value) => (value === 'yhat' ? '预测' : '真实')}
+                  />
+                  <Line
+                    type="monotone"
+                    dataKey="yhat"
+                    name="yhat"
+                    stroke="#f97316"
+                    strokeWidth={2}
+                    dot={false}
+                  />
+                  {hasActual && (
+                    <Line
+                      type="monotone"
+                      dataKey="y"
+                      name="y"
+                      stroke="#3b82f6"
+                      strokeWidth={2}
+                      dot={{ r: 3 }}
+                      connectNulls={false}
+                    />
+                  )}
                 </LineChart>
               </ResponsiveContainer>
             </div>

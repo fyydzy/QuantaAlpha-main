@@ -16,9 +16,9 @@ from dotenv import load_dotenv
 _project_root = Path(__file__).resolve().parents[1]
 _env_path = _project_root / ".env"
 if _env_path.exists():
-    load_dotenv(_env_path)
+    load_dotenv(_env_path, override=True)
 else:
-    load_dotenv(".env")
+    load_dotenv(".env", override=True)
 
 import fire
 from quantaalpha.pipeline.factor_mining import main as mine
@@ -34,12 +34,20 @@ def forecast(**kwargs):
     return forecast_from_fire(**kwargs)
 
 
+def forecast_search(**kwargs):
+    """LLM 特征组合方案搜索（固定模型对比特征组合）。"""
+    from quantaalpha.forecast_agent.solution_search import forecast_search_from_fire
+
+    return forecast_search_from_fire(**kwargs)
+
+
 def app():
     fire.Fire(
         {
             "mine": mine,
             "backtest": backtest,
             "forecast": forecast,
+            "forecast_search": forecast_search,
             "health_check": health_check,
             "collect_info": collect_info,
         }

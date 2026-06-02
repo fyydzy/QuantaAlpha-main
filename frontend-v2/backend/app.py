@@ -89,6 +89,23 @@ class ForecastStartRequest(BaseModel):
     timesfmDevice: Optional[str] = Field("cpu", description="cpu | gpu for timesfm")
 
 
+class ForecastSearchStartRequest(BaseModel):
+    """Request to start forecast feature-set search (LLM)."""
+    goal: str = Field(..., description="Natural language goal for feature-set planning")
+    province: Optional[str] = Field("河北", description="Province name for Excel lookup")
+    asOfMonth: Optional[str] = Field(None, description="Training cutoff date YYYY-MM-DD")
+    testStart: Optional[str] = Field(None, description="Test start date YYYY-MM-DD")
+    testEnd: Optional[str] = Field(None, description="Test end date YYYY-MM-DD")
+    outputDir: Optional[str] = Field(None, description="Output root directory")
+    contextLen: Optional[int] = Field(270, description="History window in decadal periods")
+    model: Optional[str] = Field("xgboost", description="Fixed backend for comparing feature sets")
+    numberOfSolutions: Optional[int] = Field(4, description="How many solutions LLM proposes")
+    maxFeatureCount: Optional[int] = Field(10, description="Max features per solution")
+    requiredFeatures: Optional[List[str]] = Field(None, description="Required features for every solution")
+    configPath: Optional[str] = Field(None, description="Path to forecast_search.yaml")
+    onlyFeedback: Optional[bool] = Field(False, description="If true, only generate feedback from existing outputs")
+
+
 class SystemConfigUpdate(BaseModel):
     """Partial update to system configuration (.env)."""
     QLIB_DATA_DIR: Optional[str] = None
@@ -120,6 +137,15 @@ def _gen_id() -> str:
 
 def _now() -> str:
     return datetime.now().isoformat()
+
+def _decode_subprocess_line(line_bytes: bytes) -> str:
+    """Best-effort decode for Windows consoles and UTF-8 Python output."""
+    for enc in ("utf-8", "gbk", "cp936"):
+        try:
+            return line_bytes.decode(enc)
+        except Exception:
+            continue
+    return line_bytes.decode("utf-8", errors="replace")
 
 
 def _load_dotenv_dict() -> Dict[str, str]:
@@ -1160,6 +1186,291 @@ async def cancel_forecast(task_id: str):
     return ApiResponse(success=True, message="燃气预测已取消")
 
 
+# ---- Forecast Search endpoints ----
+
+@app.post("/api/v1/forecast_search/start", response_model=ApiResponse)
+async def start_forecast_search(req: ForecastSearchStartRequest):
+    """Start LLM feature-set solution search for gas sales forecast."""
+    task_id = _gen_id()
+    config_path = req.configPath or str(PROJECT_ROOT / "configs" / "forecast_search.yaml")
+    output_dir = req.outputDir or f"forecast_agent_output/{req.province or '河北'}"
+
+    task = {
+        "taskId": task_id,
+        "status": "running",
+        "type": "forecast_search",
+        "config": {**req.model_dump(), "configPath": config_path, "outputDir": output_dir},
+        "progress": {
+            "phase": "planning",
+            "currentRound": 0,
+            "totalRounds": 1,
+            "progress": 0,
+            "message": "正在启动特征方案搜索...",
+            "timestamp": _now(),
+        },
+        "logs": [],
+        "metrics": {},
+        "result": None,
+        "pid": None,
+        "createdAt": _now(),
+        "updatedAt": _now(),
+    }
+    tasks[task_id] = task
+    asyncio.create_task(_run_forecast_search(task_id, req, config_path, output_dir))
+    return ApiResponse(
+        success=True,
+        data={"taskId": task_id, "task": task},
+        message="特征方案搜索已启动",
+    )
+
+
+@app.get("/api/v1/forecast_search/{task_id}", response_model=ApiResponse)
+async def get_forecast_search_status(task_id: str):
+    if task_id not in tasks:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return ApiResponse(success=True, data={"task": tasks[task_id]})
+
+
+@app.delete("/api/v1/forecast_search/{task_id}", response_model=ApiResponse)
+async def cancel_forecast_search(task_id: str):
+    if task_id not in tasks:
+        raise HTTPException(status_code=404, detail="Task not found")
+    task = tasks[task_id]
+    if task.get("pid"):
+        try:
+            os.kill(task["pid"], signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    task["status"] = "cancelled"
+    task["updatedAt"] = _now()
+    await _broadcast(task_id, {
+        "type": "result",
+        "taskId": task_id,
+        "data": {"status": "cancelled"},
+        "timestamp": _now(),
+    })
+    return ApiResponse(success=True, message="特征方案搜索已取消")
+
+
+async def _run_forecast_search(
+    task_id: str,
+    req: ForecastSearchStartRequest,
+    config_path: str,
+    output_dir: str,
+):
+    task = tasks[task_id]
+    try:
+        env = os.environ.copy()
+        env.update(_load_dotenv_dict())
+        # Force child Python output to UTF-8 to reduce mojibake on Windows.
+        env.setdefault("PYTHONIOENCODING", "utf-8")
+        env.setdefault("PYTHONUTF8", "1")
+
+        dotenv = _load_dotenv_dict()
+        conda_env = dotenv.get("CONDA_ENV_NAME", "quantaalpha")
+        python_bin = sys.executable
+        for prefix in [
+            os.path.expanduser(f"~/.conda/envs/{conda_env}"),
+        ]:
+            candidate = os.path.join(prefix, "bin", "python")
+            if os.path.isfile(candidate):
+                python_bin = candidate
+                break
+            candidate_win = os.path.join(prefix, "python.exe")
+            if os.path.isfile(candidate_win):
+                python_bin = candidate_win
+                break
+
+        # Call forecast_search_from_fire directly to allow overriding goal/province/etc.
+        # We use -c for portability and to keep logs streaming to stdout.
+        import json as _json
+
+        if req.onlyFeedback:
+            task["progress"]["phase"] = "feedback"
+            task["progress"]["message"] = "只生成总结（不重新跑方案）..."
+            task["progress"]["timestamp"] = _now()
+            await _broadcast(task_id, {"type": "progress", "taskId": task_id, "data": task["progress"], "timestamp": _now()})
+
+            payload = {
+                "output_dir": output_dir,
+                "goal": req.goal,
+            }
+            code = (
+                "import json\n"
+                "from quantaalpha.forecast_agent.forecast_feedback import FeedbackConfig, generate_forecast_search_feedback\n"
+                f"cfg = FeedbackConfig(**json.loads({ _json.dumps(_json.dumps(payload, ensure_ascii=False)) }))\n"
+                "generate_forecast_search_feedback(cfg)\n"
+            )
+        else:
+            payload = {
+                "config": config_path,
+                "goal": req.goal,
+                "province": req.province,
+                "as_of_month": req.asOfMonth,
+                "test_start": req.testStart,
+                "test_end": req.testEnd,
+                "output_dir": output_dir,
+                "context_len": req.contextLen,
+                "model": req.model,
+                "number_of_solutions": req.numberOfSolutions,
+                "max_feature_count": req.maxFeatureCount,
+                "required_features": req.requiredFeatures,
+            }
+            payload = {k: v for k, v in payload.items() if v is not None}
+            code = (
+                "import json\n"
+                "from quantaalpha.forecast_agent.solution_search import forecast_search_from_fire\n"
+                f"kwargs = json.loads({ _json.dumps(_json.dumps(payload, ensure_ascii=False)) })\n"
+                "forecast_search_from_fire(**kwargs)\n"
+            )
+
+        cmd = [python_bin, "-c", code]
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            cwd=str(PROJECT_ROOT),
+            env=env,
+        )
+        task["pid"] = proc.pid
+        task["progress"]["phase"] = "running"
+        task["progress"]["message"] = "正在执行方案搜索..."
+        task["progress"]["timestamp"] = _now()
+        await _broadcast(task_id, {"type": "progress", "taskId": task_id, "data": task["progress"], "timestamp": _now()})
+
+        while True:
+            line_bytes = await proc.stdout.readline()
+            if not line_bytes:
+                break
+            line = _decode_subprocess_line(line_bytes).rstrip()
+            if not line:
+                continue
+
+            level = "info"
+            if "ERROR" in line or "Error" in line:
+                level = "error"
+            elif "WARNING" in line:
+                level = "warning"
+            elif "完成" in line or "success" in line.lower():
+                level = "success"
+
+            log_entry = {"id": _gen_id(), "timestamp": _now(), "level": level, "message": line[:500]}
+            task["logs"].append(log_entry)
+            if len(task["logs"]) > 2000:
+                task["logs"] = task["logs"][-2000:]
+
+            await _broadcast(task_id, {"type": "log", "taskId": task_id, "data": log_entry, "timestamp": _now()})
+
+            if any(kw in line for kw in ["forecast_search", "solution_", "leaderboard", "feedback", "完成"]):
+                task["progress"]["message"] = line[:200]
+                task["progress"]["timestamp"] = _now()
+                await _broadcast(task_id, {"type": "progress", "taskId": task_id, "data": task["progress"], "timestamp": _now()})
+
+        exit_code = await proc.wait()
+        task["pid"] = None
+        task["status"] = "completed" if exit_code == 0 else "failed"
+        task["updatedAt"] = _now()
+
+        if exit_code == 0:
+            task["progress"]["phase"] = "completed"
+            task["progress"]["progress"] = 100
+            task["progress"]["message"] = "方案搜索完成"
+            _load_forecast_search_results(task, output_dir)
+        else:
+            task["progress"]["message"] = f"方案搜索失败 (exit code: {exit_code})"
+
+        await _broadcast(task_id, {
+            "type": "result",
+            "taskId": task_id,
+            "data": {"status": task["status"], "metrics": task.get("metrics", {})},
+            "timestamp": _now(),
+        })
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        task["status"] = "failed"
+        task["progress"]["message"] = str(e)
+        task["updatedAt"] = _now()
+        await _broadcast(task_id, {"type": "error", "taskId": task_id, "data": {"error": str(e)}, "timestamp": _now()})
+
+
+def _load_forecast_search_results(task: Dict[str, Any], output_dir: str):
+    """Load forecast_search outputs for the UI."""
+    try:
+        out = Path(output_dir)
+        if not out.is_absolute():
+            out = PROJECT_ROOT / out
+
+        metrics: Dict[str, Any] = {}
+
+        leaderboard_path = out / "solution_leaderboard.csv"
+        if leaderboard_path.exists():
+            import pandas as pd
+
+            df = pd.read_csv(leaderboard_path)
+            metrics["leaderboard"] = df.to_dict(orient="records")
+            metrics["leaderboard_csv"] = str(leaderboard_path)
+
+        library_path = out / "solution_library.json"
+        if library_path.exists():
+            metrics["solution_library_json"] = str(library_path)
+            metrics["solution_library"] = json.loads(library_path.read_text(encoding="utf-8"))
+
+        feedback_json = out / "forecast_feedback.json"
+        if feedback_json.exists():
+            metrics["forecast_feedback_json"] = str(feedback_json)
+            metrics["forecast_feedback"] = json.loads(feedback_json.read_text(encoding="utf-8"))
+
+        feedback_md = out / "forecast_feedback.md"
+        if feedback_md.exists():
+            metrics["forecast_feedback_md"] = str(feedback_md)
+            metrics["forecast_feedback_md_text"] = feedback_md.read_text(encoding="utf-8", errors="replace")
+
+        fixed_model = "xgboost"
+        if isinstance(metrics.get("solution_library"), dict):
+            fixed_model = str(metrics["solution_library"].get("fixed_model") or fixed_model)
+
+        solution_test_results: Dict[str, Any] = {}
+        for row in metrics.get("leaderboard", []):
+            if not isinstance(row, dict):
+                continue
+            sid = row.get("solution_id")
+            if not sid:
+                continue
+            model_name = str(row.get("model") or fixed_model)
+            out_raw = row.get("output_dir")
+            if out_raw:
+                model_dir = Path(str(out_raw))
+                if not model_dir.is_absolute():
+                    model_dir = PROJECT_ROOT / model_dir
+            else:
+                model_dir = out / "solutions" / str(sid) / model_name
+
+            points = _load_forecast_test_points_for_ui(model_dir, model_name)
+            curve = [
+                {"ds": p["ds"], "yhat": p.get("yhat"), "y": p.get("y")}
+                for p in points
+                if p.get("ds")
+            ]
+            solution_test_results[str(sid)] = {
+                "solution_id": sid,
+                "name": row.get("name"),
+                "model": model_name,
+                "mape": row.get("MAPE"),
+                "rmse": row.get("RMSE"),
+                "r2": row.get("R2"),
+                "curve": curve,
+                "table": points,
+            }
+        if solution_test_results:
+            metrics["solution_test_results"] = solution_test_results
+
+        task["metrics"] = metrics
+    except Exception:
+        import traceback
+        traceback.print_exc()
+
 async def _run_forecast(
     task_id: str,
     req: ForecastStartRequest,
@@ -1170,6 +1481,9 @@ async def _run_forecast(
     try:
         env = os.environ.copy()
         env.update(_load_dotenv_dict())
+        # Force child Python output to UTF-8 to reduce mojibake on Windows.
+        env.setdefault("PYTHONIOENCODING", "utf-8")
+        env.setdefault("PYTHONUTF8", "1")
 
         dotenv = _load_dotenv_dict()
         conda_env = dotenv.get("CONDA_ENV_NAME", "quantaalpha")
@@ -1229,7 +1543,7 @@ async def _run_forecast(
             line_bytes = await proc.stdout.readline()
             if not line_bytes:
                 break
-            line = line_bytes.decode("utf-8", errors="replace").rstrip()
+            line = _decode_subprocess_line(line_bytes).rstrip()
             if not line:
                 continue
 
@@ -1302,6 +1616,92 @@ async def _run_forecast(
         })
 
 
+def _load_forecast_test_points_for_ui(model_dir: Path, model_name: str) -> list[dict[str, Any]]:
+    """读取测试集预测点（日期、预测值、真实值），供曲线与表格共用。"""
+    import pandas as pd
+
+    from quantaalpha.forecast_agent.data import normalize_period, period_to_start_date
+
+    test_xlsx = model_dir / f"{model_name}_test.xlsx"
+    test_csv = model_dir / f"{model_name}_test.csv"
+    if test_xlsx.exists():
+        test_df = pd.read_excel(test_xlsx)
+    elif test_csv.exists():
+        test_df = pd.read_csv(test_csv)
+    else:
+        test_df = None
+
+    if test_df is None or not {"predicted_gas_sales", "actual_gas_sales"}.issubset(set(test_df.columns)):
+        return []
+
+    df = test_df.copy()
+    if "phase" in df.columns:
+        df = df[df["phase"].astype(str).str.lower() == "test"].copy()
+    if df.empty:
+        return []
+
+    def _row_ds(row: pd.Series) -> str | None:
+        if "date" in df.columns and pd.notna(row.get("date")):
+            try:
+                return pd.Timestamp(row["date"]).strftime("%Y-%m-%d")
+            except Exception:
+                return None
+        if "month" in df.columns and pd.notna(row.get("month")):
+            try:
+                return period_to_start_date(normalize_period(row["month"])).strftime("%Y-%m-%d")
+            except Exception:
+                return None
+        return None
+
+    points: list[dict[str, Any]] = []
+    for _, row in df.iterrows():
+        ds = _row_ds(row)
+        if not ds:
+            continue
+        yhat = row.get("predicted_gas_sales")
+        y = row.get("actual_gas_sales")
+        if pd.isna(yhat) and pd.isna(y):
+            continue
+        period = str(row.get("month", "")) if "month" in df.columns and pd.notna(row.get("month")) else ""
+        point: dict[str, Any] = {"ds": ds, "period": period}
+        if pd.notna(yhat):
+            point["yhat"] = float(yhat)
+        if pd.notna(y):
+            point["y"] = float(y)
+        if pd.notna(yhat) and pd.notna(y) and float(y) != 0:
+            point["error_pct"] = (float(yhat) - float(y)) / float(y) * 100.0
+        points.append(point)
+
+    points.sort(key=lambda p: p.get("ds", ""))
+    return points
+
+
+def _load_forecast_curve_for_ui(model_dir: Path, model_name: str) -> list[dict[str, Any]]:
+    """读取测试集曲线（优先），供前端绘制预测值 vs 真实值。"""
+    points = _load_forecast_test_points_for_ui(model_dir, model_name)
+    if points:
+        curve: list[dict[str, Any]] = []
+        for p in points:
+            item: dict[str, Any] = {"ds": p["ds"]}
+            if p.get("yhat") is not None:
+                item["yhat"] = p["yhat"]
+            if p.get("y") is not None:
+                item["y"] = p["y"]
+            curve.append(item)
+        return curve
+
+    # Fallback: forecast csv (prediction only).
+    import pandas as pd
+
+    csv_path = model_dir / f"{model_name}_forecast.csv"
+    if not csv_path.exists():
+        return []
+    forecast_df = pd.read_csv(csv_path)
+    if "ds" not in forecast_df.columns or "yhat" not in forecast_df.columns:
+        return []
+    return [{"ds": str(r["ds"])[:10], "yhat": float(r["yhat"])} for r in forecast_df.to_dict(orient="records")]
+
+
 def _load_forecast_results(task: Dict[str, Any], output_dir: str, model: str):
     """Load forecast summary JSON and optional forecast curve for the UI."""
     try:
@@ -1339,16 +1739,10 @@ def _load_forecast_results(task: Dict[str, Any], output_dir: str, model: str):
 
         best_model = metrics.get("best_model") or model
         if best_model and best_model != "auto_select":
-            csv_path = out / str(best_model) / f"{best_model}_forecast.csv"
-            if csv_path.exists():
-                import pandas as pd
-
-                df = pd.read_csv(csv_path)
-                if "ds" in df.columns and "yhat" in df.columns:
-                    metrics["forecast_curve"] = [
-                        {"ds": str(r["ds"]), "yhat": float(r["yhat"])}
-                        for r in df.to_dict(orient="records")
-                    ]
+            model_dir = out / str(best_model)
+            curve = _load_forecast_curve_for_ui(model_dir, str(best_model))
+            if curve:
+                metrics["forecast_curve"] = curve
 
         task["metrics"] = metrics
     except Exception:

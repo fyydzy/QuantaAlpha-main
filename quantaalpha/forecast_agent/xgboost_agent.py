@@ -28,6 +28,7 @@ from quantaalpha.forecast_agent.data import (
     load_task_context,
     tabular_feature_columns,
 )
+from quantaalpha.forecast_agent.feature_engineering import select_feature_columns
 from quantaalpha.forecast_agent.framework import (
     ForecastAgent,
     ForecastEvaluator,
@@ -126,7 +127,8 @@ def _prepare_train_and_future(
         missing = sorted(set(ctx.forecast_months) - set(future_df[MONTH_COL].astype(str)))
         raise ValueError(f"XGBoost 特征旬不完整，缺少: {missing}")
 
-    feature_cols = tabular_feature_columns(feature_df)
+    feature_set = getattr(ctx, "task_feature_set", None)
+    feature_cols = select_feature_columns(feature_df, feature_set=feature_set, allowlist=None)
     data_debug = {
         "feature_rows_total": int(len(feature_df)),
         "train_rows_before_context": int(len(train_df_full)),
@@ -210,6 +212,7 @@ def _refit_full_train(
 class XgboostEvaluator(ForecastEvaluator):
     def evaluate(self, task: ForecastTask, subjects: ForecastSubjects) -> ForecastFeedback:
         ctx = load_task_context(task)
+        setattr(ctx, "task_feature_set", list(getattr(task, "feature_set", []) or []))
         params: XgboostHyperParams = subjects.params  # type: ignore[assignment]
         try:
             train_df, _, feature_cols, data_debug = _prepare_train_and_future(ctx, params)
@@ -371,6 +374,7 @@ class AutoXgboostForecastAgent(ForecastAgent):
 
     def refit_and_forecast(self, task: ForecastTask, params: XgboostHyperParams) -> dict[str, Any]:
         ctx = load_task_context(task)
+        setattr(ctx, "task_feature_set", list(getattr(task, "feature_set", []) or []))
         train_df, future_df, feature_cols, data_debug = _prepare_train_and_future(ctx, params)
         X_train = train_df[feature_cols].to_numpy(dtype=float)
         y_train = train_df[TARGET_COL].to_numpy(dtype=float)
@@ -397,6 +401,7 @@ class AutoXgboostForecastAgent(ForecastAgent):
             "data_debug": {
                 **data_debug,
                 **split_debug,
+                "feature_cols_used": list(feature_cols),
             },
         }
 
@@ -440,6 +445,13 @@ class AutoXgboostForecastAgent(ForecastAgent):
                 **ctx.metadata,
                 "horizon": ctx.horizon,
                 "selection_metric": self.selection_metric,
+            },
+            "solution": {
+                "solution_id": getattr(task, "solution_id", None),
+                "solution_name": getattr(task, "solution_name", None),
+                "hypothesis": getattr(task, "hypothesis", None),
+                "feature_set": list(getattr(task, "feature_set", []) or []),
+                "feature_cols_used": list((final_result.get("data_debug", {}) or {}).get("feature_cols_used", [])),
             },
             "best_params": best_step.evolvable_subjects.params.to_dict(),
             "best_feedback": asdict(best_step.feedback) if best_step.feedback else {},

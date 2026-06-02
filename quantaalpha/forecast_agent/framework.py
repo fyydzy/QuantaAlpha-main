@@ -33,6 +33,12 @@ class ForecastTask:
     test_start: str | None = None
     test_end: str | None = None
 
+    # Optional: for forecast_search feature-set experiments
+    solution_id: str | None = None
+    solution_name: str | None = None
+    hypothesis: str | None = None
+    feature_set: list[str] = field(default_factory=list)
+
 
 @dataclass
 class ForecastSubjects:
