@@ -84,6 +84,22 @@ CLI 时间参数仅接受旬开始日 `YYYY-MM-DD`（如 `2025-06-21`），**不
 
 - 单模型：`{output_dir}/{model}/` 下 `*_forecast.csv`、`*_best_summary.json`、`*_forecast_plot.png`
 - `auto`：`{output_dir}/model_selection_summary.json` 与 `forecast_result.json`
+- 各模型 `*_best_summary.json` 含 `feature_set`、`feature_cols_used`（第二版起），便于核对实际训练列
+
+## 按模型配置特征（第二版）
+
+在 [`configs/forecast.yaml`](../configs/forecast.yaml) 中可为每个模型单独指定特征列（与 `forecast_search` 的 LLM 方案搜索无关）：
+
+```yaml
+model_features:
+  xgboost: [HDD, Lag_36, is_heating_season, avg_temp]
+  lasso: [HDD, Lag_36, month_sin, month_cos]
+  lightgbm: null   # null 或省略表示使用该模型默认全部 tabular 数值列
+```
+
+- `model: auto` 时，每个候选模型读取各自的 `model_features` 配置
+- LSTM 仅支持 `Lag_36`、`HDD`、`is_heating_season` 的子集；SARIMAX 仅支持天气外生列子集
+- 详见 [`docs/第二版修改方案.md`](第二版修改方案.md)
 
 ## 依赖（extra）
 

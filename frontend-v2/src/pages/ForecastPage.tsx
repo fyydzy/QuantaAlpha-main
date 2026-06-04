@@ -37,6 +37,40 @@ const MODEL_OPTIONS = [
   { value: 'timesfm', label: 'TimesFM' },
 ];
 
+const TABULAR_FEATURE_OPTIONS = [
+  'avg_temp',
+  'max_temp',
+  'min_temp',
+  'HDD',
+  'extreme_cold_days',
+  'temp_range',
+  'time_index',
+  'month_sin',
+  'month_cos',
+  'ten_sin',
+  'ten_cos',
+  'is_heating_season',
+  'spring_rework_peak',
+  'Lag_36',
+  'HDD_squared',
+  'HDD_cross_Lag_36',
+  'HDD_cross_HeatingSeason',
+  'HDD_cross_spring_rework_peak',
+  'ColdDays_cross_Lag_36',
+];
+
+const FEATURE_OPTIONS_BY_MODEL: Record<string, string[]> = {
+  lasso: TABULAR_FEATURE_OPTIONS,
+  ridge: TABULAR_FEATURE_OPTIONS,
+  elasticnet: TABULAR_FEATURE_OPTIONS,
+  xgboost: TABULAR_FEATURE_OPTIONS,
+  lightgbm: TABULAR_FEATURE_OPTIONS,
+  catboost: TABULAR_FEATURE_OPTIONS,
+  random_forest: TABULAR_FEATURE_OPTIONS,
+  sarimax: ['avg_temp', 'max_temp', 'min_temp', 'HDD', 'extreme_cold_days', 'temp_range'],
+  lstm: ['Lag_36', 'HDD', 'is_heating_season'],
+};
+
 export const ForecastPage: React.FC = () => {
   const {
     backendAvailable,
@@ -52,16 +86,33 @@ export const ForecastPage: React.FC = () => {
   const [testStart, setTestStart] = useState('2025-11-01');
   const [testEnd, setTestEnd] = useState('2026-03-21');
   const [contextLen, setContextLen] = useState(270);
+  const [selectedFeatures, setSelectedFeatures] = useState<string[]>([]);
   const [isStarting, setIsStarting] = useState(false);
   const logsEndRef = useRef<HTMLDivElement>(null);
+  const modelFeatureOptions = FEATURE_OPTIONS_BY_MODEL[model] || [];
 
   useEffect(() => {
     logsEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [logs]);
 
+  useEffect(() => {
+    setSelectedFeatures((prev) => prev.filter((f) => modelFeatureOptions.includes(f)));
+  }, [model]);
+
+  const toggleFeature = (feature: string) => {
+    setSelectedFeatures((prev) => (
+      prev.includes(feature)
+        ? prev.filter((f) => f !== feature)
+        : [...prev, feature]
+    ));
+  };
+
   const handleStart = async () => {
     setIsStarting(true);
     try {
+      const modelFeatures = model !== 'auto' && modelFeatureOptions.length > 0 && selectedFeatures.length > 0
+        ? { [model]: selectedFeatures }
+        : undefined;
       await startForecastTask({
         model,
         province,
@@ -70,6 +121,7 @@ export const ForecastPage: React.FC = () => {
         testEnd,
         contextLen,
         outputDir: `forecast_agent_output/${province}`,
+        modelFeatures,
       });
     } catch (err) {
       console.error('Failed to start forecast:', err);
@@ -136,6 +188,44 @@ export const ForecastPage: React.FC = () => {
               ))}
             </select>
           </label>
+          <div className="text-sm md:col-span-2 lg:col-span-3">
+            <span className="text-muted-foreground">特征组合选择（当前模型）</span>
+            <div className="mt-2 rounded-lg bg-secondary/30 border border-border p-3">
+              {model === 'auto' && (
+                <p className="text-xs text-muted-foreground">
+                  auto 比选暂不支持在页面里统一指定特征；请先选择具体模型后再勾选特征。
+                </p>
+              )}
+              {model === 'timesfm' && (
+                <p className="text-xs text-muted-foreground">
+                  TimesFM 不使用 tabular 特征列，无需选择。
+                </p>
+              )}
+              {model !== 'auto' && model !== 'timesfm' && (
+                <>
+                  <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-2">
+                    {modelFeatureOptions.map((feature) => (
+                      <label
+                        key={feature}
+                        className="flex items-center gap-2 text-xs text-foreground/90"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={selectedFeatures.includes(feature)}
+                          onChange={() => toggleFeature(feature)}
+                          disabled={isRunning}
+                        />
+                        <span>{feature}</span>
+                      </label>
+                    ))}
+                  </div>
+                  <p className="text-xs text-muted-foreground mt-2">
+                    不勾选任何特征时，仍按配置默认行为（通常为该模型默认全集）。
+                  </p>
+                </>
+              )}
+            </div>
+          </div>
           <label className="text-sm">
             <span className="text-muted-foreground">context_len（旬）</span>
             <input
@@ -191,7 +281,16 @@ export const ForecastPage: React.FC = () => {
         {task?.status && (
           <Badge variant={task.status === 'completed' ? 'default' : 'outline'}>{task.status}</Badge>
         )}
-        {metrics.best_model && <Badge variant="outline">最优: {metrics.best_model}</Badge>}
+        {(metrics.display_model || metrics.best_model) && (
+          <Badge variant="outline">
+            展示: {metrics.display_model || metrics.best_model}
+          </Badge>
+        )}
+        {Array.isArray(metrics.feature_cols_used) && metrics.feature_cols_used.length > 0 && (
+          <Badge variant="outline" title={metrics.feature_cols_used.join(', ')}>
+            特征 {metrics.feature_cols_used.length} 列
+          </Badge>
+        )}
       </div>
 
       {(testMetrics.MAPE != null || testMetrics.RMSE != null) && (

@@ -3,6 +3,7 @@ import { HomePage } from '@/pages/HomePage';
 import { MiningDashboardPage } from '@/pages/MiningDashboardPage';
 import { FactorLibraryPage } from '@/pages/FactorLibraryPage';
 import { BacktestPage } from '@/pages/BacktestPage';
+import { WeatherForecastPage } from '@/pages/WeatherForecastPage';
 import { ForecastPage } from '@/pages/ForecastPage';
 import { ForecastSearchPage } from '@/pages/ForecastSearchPage';
 import { SettingsPage } from '@/pages/SettingsPage';
@@ -51,14 +52,19 @@ const AppContent: React.FC = () => {
           <BacktestPage />
         </Layout>
       </div>
-      <div style={{ display: currentPage === 'forecast' ? 'block' : 'none' }}>
+      <div style={{ display: currentPage === 'weather' ? 'block' : 'none' }}>
         <Layout currentPage={currentPage} onNavigate={setCurrentPage}>
-          <ForecastPage />
+          <WeatherForecastPage />
         </Layout>
       </div>
       <div style={{ display: currentPage === 'forecast_search' ? 'block' : 'none' }}>
         <Layout currentPage={currentPage} onNavigate={setCurrentPage}>
           <ForecastSearchPage />
+        </Layout>
+      </div>
+      <div style={{ display: currentPage === 'forecast' ? 'block' : 'none' }}>
+        <Layout currentPage={currentPage} onNavigate={setCurrentPage}>
+          <ForecastPage />
         </Layout>
       </div>
       <div style={{ display: currentPage === 'settings' ? 'block' : 'none' }}>

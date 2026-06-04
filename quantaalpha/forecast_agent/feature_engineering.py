@@ -266,6 +266,16 @@ def select_feature_columns(
     return candidate
 
 
+def resolve_feature_columns(
+    feature_df: pd.DataFrame,
+    feature_set: list[str] | None,
+    *,
+    allowlist: set[str] | None = None,
+) -> list[str]:
+    """统一入口：forecast / forecast_search 按 feature_set 选训练列。"""
+    return select_feature_columns(feature_df, feature_set or None, allowlist=allowlist)
+
+
 __all__ = [
     "DATE_COL",
     "WEATHER_INPUT_COLS",
@@ -282,5 +292,6 @@ __all__ = [
     "add_lag_rolling_features",
     "add_interaction_features",
     "select_feature_columns",
+    "resolve_feature_columns",
     "build_features_pipeline",
 ]

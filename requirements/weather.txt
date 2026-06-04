@@ -1,0 +1,5 @@
+# ECMWF CDS 季节预报下载与处理（见 docs/天气预测方案.md）
+cdsapi>=0.7.7
+xarray>=2023.1
+netCDF4>=1.6
+h5netcdf>=1.2

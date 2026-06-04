@@ -359,6 +359,11 @@ def filter_periods_in(df: pd.DataFrame, periods: list[str]) -> pd.DataFrame:
     )
 
 
+def feature_set_from_task(task: ForecastTask) -> list[str]:
+    """Configured feature columns from forecast YAML model_features."""
+    return list(getattr(task, "feature_set", None) or [])
+
+
 def tabular_feature_columns(df: pd.DataFrame) -> list[str]:
     """返回可直接喂给 sklearn/GBDT 的数值特征列。"""
     excluded = {DATE_COL, MONTH_COL, TARGET_COL}
@@ -584,6 +589,7 @@ __all__ = [
     "period_between",
     "filter_through_period",
     "filter_periods_in",
+    "feature_set_from_task",
     "tabular_feature_columns",
     "period_range",
     "month_range",

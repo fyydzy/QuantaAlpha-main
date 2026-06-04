@@ -158,6 +158,86 @@ export async function cancelBacktest(taskId: string) {
   return request(`/api/v1/backtest/${taskId}`, { method: 'DELETE' });
 }
 
+// ========================== Weather CSV API ==========================
+
+export interface WeatherDataSource {
+  title: string;
+  dataset: string;
+  url: string;
+  variable: string;
+  step: string;
+  horizon: string;
+  initDate: string;
+  area: string;
+  gridNote: string;
+}
+
+export interface WeatherFilesResponse {
+  previewFiles: string[];
+  dailyFiles: string[];
+  dataSource: WeatherDataSource;
+  weatherDir: string;
+}
+
+export interface WeatherPreviewMeta {
+  file: string;
+  dates: string[];
+  hoursByDate: Record<string, number[]>;
+  gridLatitude: number | null;
+  gridLongitude: number | null;
+  rowCount: number;
+}
+
+export interface WeatherPreviewValue {
+  dateBj: string;
+  hourBj: number;
+  temperatureC: number;
+  aggMode: 'mean' | 'member';
+  member: number | null;
+  memberCount: number;
+  sampleCount: number;
+  tempMinC: number;
+  tempMaxC: number;
+  tempP10C?: number;
+  tempP50C?: number;
+  tempP90C?: number;
+  validTimeUtc?: string | null;
+  validTimeBj?: string | null;
+}
+
+export interface WeatherDailyRow {
+  dateBj: string;
+  tempMeanC: number; // backwards-compatible field name in frontend
+  tempP10C?: number;
+  tempP50C?: number;
+  tempP90C?: number;
+}
+
+export async function getWeatherFiles() {
+  return request<WeatherFilesResponse>('/api/v1/weather/files');
+}
+
+export async function getWeatherPreviewMeta(file: string) {
+  return request<WeatherPreviewMeta>(
+    `/api/v1/weather/preview/meta?file=${encodeURIComponent(file)}`
+  );
+}
+
+export async function getWeatherPreviewValue(
+  file: string,
+  dateBj: string,
+  hourBj: number
+) {
+  const q = new URLSearchParams({ file, date_bj: dateBj, hour_bj: String(hourBj) });
+  return request<WeatherPreviewValue>(`/api/v1/weather/preview/value?${q}`);
+}
+
+export async function getWeatherDaily(file: string) {
+  return request<{ file: string; rows: WeatherDailyRow[]; tempColumn: string }>(
+    `/api/v1/weather/daily?file=${encodeURIComponent(file)}`
+  );
+}
+
 // ========================== Forecast API ==========================
 
 export interface ForecastStartParams {
@@ -173,6 +253,7 @@ export interface ForecastStartParams {
   configPath?: string;
   selectionMetric?: string;
   timesfmDevice?: string;
+  modelFeatures?: Record<string, string[]>;
 }
 
 export async function startForecast(params: ForecastStartParams) {

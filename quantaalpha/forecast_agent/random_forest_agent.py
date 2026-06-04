@@ -27,9 +27,10 @@ from quantaalpha.forecast_agent.data import (
     filter_periods_in,
     filter_through_period,
     load_tabular_feature_frame,
+    feature_set_from_task,
     load_task_context,
-    tabular_feature_columns,
 )
+from quantaalpha.forecast_agent.feature_engineering import resolve_feature_columns
 from quantaalpha.forecast_agent.framework import (
     ForecastAgent,
     ForecastEvaluator,
@@ -106,6 +107,8 @@ def _apply_context_window(df: pd.DataFrame, context_len: int) -> pd.DataFrame:
 def _prepare_train_and_future(
     ctx: TaskContext,
     params: RandomForestHyperParams,
+    *,
+    feature_set: list[str] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
     path = str(ctx.metadata["excel_path"])
     as_of = str(ctx.metadata["as_of_month"])
@@ -124,7 +127,7 @@ def _prepare_train_and_future(
         missing = sorted(set(ctx.forecast_months) - set(future_df[MONTH_COL].astype(str)))
         raise ValueError(f"随机森林特征旬不完整，缺少: {missing}")
 
-    feature_cols = tabular_feature_columns(feature_df)
+    feature_cols = resolve_feature_columns(feature_df, feature_set)
     return train_df, future_df, feature_cols
 
 
@@ -255,7 +258,9 @@ class RandomForestEvaluator(ForecastEvaluator):
         params: RandomForestHyperParams = subjects.params  # type: ignore[assignment]
         self._last_fit_bundle = None
         try:
-            train_df, future_df, feature_cols = _prepare_train_and_future(ctx, params)
+            train_df, future_df, feature_cols = _prepare_train_and_future(
+                ctx, params, feature_set=feature_set_from_task(task)
+            )
             model, best_params, grid_df = _fit_rf_with_search(train_df, feature_cols)
             self._last_fit_bundle = (best_params, grid_df)
             yhat = np.asarray(model.predict(future_df[feature_cols]), dtype=float)
@@ -369,7 +374,8 @@ class AutoRandomForestForecastAgent(ForecastAgent):
 
     def refit_and_forecast(self, task: ForecastTask, params: RandomForestHyperParams) -> dict[str, Any]:
         ctx = load_task_context(task)
-        train_df, future_df, feature_cols = _prepare_train_and_future(ctx, params)
+        fs = feature_set_from_task(task)
+        train_df, future_df, feature_cols = _prepare_train_and_future(ctx, params, feature_set=fs)
         ev = self.evaluator
         bundle = getattr(ev, "_last_fit_bundle", None) if isinstance(ev, RandomForestEvaluator) else None
         if bundle is not None:
@@ -388,6 +394,8 @@ class AutoRandomForestForecastAgent(ForecastAgent):
             "best_rf_params": best_params,
             "grid_search_df": grid_df,
             "top_feature_importance": top_importance,
+            "feature_set": fs,
+            "feature_cols_used": list(feature_cols),
         }
 
     def save_outputs(
@@ -440,6 +448,8 @@ class AutoRandomForestForecastAgent(ForecastAgent):
             "test_metrics": forecast_metrics(y_true, y_pred),
             "rf_params": dict(bp),
             "top_feature_importance": final_result.get("top_feature_importance", {}),
+            "feature_set": final_result.get("feature_set", list(getattr(task, "feature_set", []) or [])),
+            "feature_cols_used": final_result.get("feature_cols_used", []),
             result_path_key: str(result_path),
         }
         summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
