@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +26,25 @@ from quantaalpha.forecast_agent.xgboost_agent import AutoXgboostForecastAgent
 DEFAULT_CANDIDATE_MODELS = (
     "sarimax,lasso,elasticnet,ridge,lstm,xgboost,lightgbm,catboost,random_forest"
 )
+
+
+def _parse_model_features(raw: Any) -> dict[str, list[str] | None]:
+    """Parse YAML model_features: model -> list[str] | None."""
+    if raw in (None, "", "null"):
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("model_features 必须是对象（model 名 -> 特征列列表或 null）")
+    out: dict[str, list[str] | None] = {}
+    for key, val in raw.items():
+        model = str(key).strip().lower()
+        if val in (None, "null"):
+            out[model] = None
+        elif isinstance(val, list):
+            cols = [str(x).strip() for x in val if str(x).strip()]
+            out[model] = cols if cols else None
+        else:
+            raise ValueError(f"model_features.{key} 必须是列表或 null")
+    return out
 
 
 def _normalize_candidates(raw: str) -> list[str]:
@@ -126,6 +145,17 @@ class ForecastRunConfig:
     selection_metric: str = "mape"
     candidate_models: str = DEFAULT_CANDIDATE_MODELS
     timesfm_device: str = "cpu"
+    model_features: dict[str, list[str] | None] = field(default_factory=dict)
+
+    def feature_set_for_model(self, model_name: str) -> list[str]:
+        """Resolved feature columns for a backend (empty = agent default)."""
+        from quantaalpha.forecast_agent.model_feature_capabilities import resolve_model_feature_set
+
+        key = model_name.strip().lower()
+        configured = self.model_features.get(key)
+        if configured is None and key not in self.model_features:
+            return []
+        return resolve_model_feature_set(key, configured)
 
     def to_task(self, out_root: Path | None = None) -> ForecastTask:
         root = out_root if out_root is not None else Path(self.output_dir)
@@ -167,6 +197,35 @@ def _run_single_model(
     if model_name not in MODEL_FACTORY_KEYS:
         raise ValueError(f"Unsupported model: {model_name}")
 
+    feature_set = config.feature_set_for_model(model_name)
+    from quantaalpha.forecast_agent.model_feature_capabilities import (
+        TABULAR_MODELS,
+        preflight_tabular_feature_set,
+    )
+
+    configured = config.model_features.get(model_name.strip().lower())
+    if model_name in TABULAR_MODELS and not feature_set:
+        if configured is None and model_name not in config.model_features:
+            feat_msg = "未配置 model_features → 默认全部 tabular 数值列"
+        else:
+            feat_msg = "model_features 为空/null → 默认全部 tabular 数值列"
+        print(f"[forecast] {model_name}: {feat_msg}", flush=True)
+    elif feature_set:
+        print(f"[forecast] {model_name} 特征列 ({len(feature_set)}): {', '.join(feature_set)}", flush=True)
+
+    if feature_set and model_name in TABULAR_MODELS:
+        excel = base_task.excel_path
+        if excel is None and base_task.province:
+            from quantaalpha.forecast_agent.data import find_processed_excel
+
+            excel = Path(find_processed_excel(str(base_task.province)))
+        if excel is not None:
+            preflight_tabular_feature_set(
+                model_name,
+                feature_set,
+                excel_path=str(excel),
+            )
+
     task = ForecastTask(
         output_dir=out_root / model_name,
         excel_path=base_task.excel_path,
@@ -174,6 +233,7 @@ def _run_single_model(
         as_of_month=base_task.as_of_month,
         test_start=base_task.test_start,
         test_end=base_task.test_end,
+        feature_set=list(feature_set),
     )
     factories = _build_model_factories(_config_to_namespace(config))
     agent = factories[model_name]
@@ -181,6 +241,19 @@ def _run_single_model(
     test_metrics = _extract_test_metrics(result)
     if test_metrics is not None:
         result["test_metrics"] = test_metrics
+    summary_json = (result.get("outputs") or {}).get("summary_json")
+    if summary_json:
+        try:
+            summary = json.loads(Path(summary_json).read_text(encoding="utf-8"))
+            cols_used = summary.get("feature_cols_used")
+            if cols_used:
+                print(
+                    f"[forecast] {model_name} 实际训练列: {', '.join(cols_used)}",
+                    flush=True,
+                )
+                result["feature_cols_used"] = cols_used
+        except Exception:
+            pass
     return result
 
 
@@ -365,6 +438,7 @@ def load_config_from_yaml(yaml_path: str | Path) -> ForecastRunConfig:
         selection_metric=str(raw.get("selection_metric", "mape")),
         candidate_models=str(raw.get("candidate_models", DEFAULT_CANDIDATE_MODELS)),
         timesfm_device=str(raw.get("timesfm_device", "cpu")),
+        model_features=_parse_model_features(raw.get("model_features")),
     )
 
 
@@ -386,6 +460,7 @@ def merge_config_with_overrides(
         "timesfm_device": "timesfm_device",
         "model": "model",
         "province": "province",
+        "model_features": "model_features",
     }
     for key, value in overrides.items():
         if value is None:
@@ -412,9 +487,25 @@ _FIRE_KEY_MAP = {
 }
 
 
+def _default_forecast_config_path() -> str | None:
+    """Best-effort default config for `quantaalpha forecast` Fire entry."""
+    candidates = [
+        Path.cwd() / "configs" / "forecast.yaml",
+        Path(__file__).resolve().parents[2] / "configs" / "forecast.yaml",
+    ]
+    for path in candidates:
+        if path.exists():
+            return str(path)
+    return None
+
+
 def forecast_from_fire(**kwargs: Any) -> dict[str, Any]:
     """Google Fire 入口：quantaalpha forecast ..."""
-    config_path = kwargs.pop("config", None) or kwargs.pop("config_path", None)
+    config_path = (
+        kwargs.pop("config", None)
+        or kwargs.pop("config_path", None)
+        or _default_forecast_config_path()
+    )
     if config_path:
         base = load_config_from_yaml(config_path)
     else:

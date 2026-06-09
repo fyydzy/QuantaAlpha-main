@@ -73,6 +73,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="各模型使用的固定历史窗口长度（旬数，非月数）",
     )
+    parser.add_argument(
+        "--model-features-json",
+        default=None,
+        help="JSON 字符串，覆盖 YAML 的 model_features（例如: {\"lasso\":[\"HDD\",\"Lag_36\"]}）",
+    )
     return parser
 
 
@@ -90,6 +95,11 @@ def _args_to_overrides(args: argparse.Namespace) -> dict[str, Any]:
         "candidate_models": args.candidate_models,
         "timesfm_device": args.timesfm_device,
     }
+    if args.model_features_json:
+        try:
+            mapping["model_features"] = json.loads(args.model_features_json)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"--model-features-json 不是合法 JSON: {exc}") from exc
     return {k: v for k, v in mapping.items() if v is not None}
 
 

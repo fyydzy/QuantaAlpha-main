@@ -87,6 +87,10 @@ class ForecastStartRequest(BaseModel):
     configPath: Optional[str] = Field(None, description="Path to forecast.yaml")
     selectionMetric: Optional[str] = Field("mape", description="mape | score")
     timesfmDevice: Optional[str] = Field("cpu", description="cpu | gpu for timesfm")
+    modelFeatures: Optional[Dict[str, List[str]]] = Field(
+        None,
+        description="Optional per-model feature overrides, e.g. {'lasso': ['HDD','Lag_36']}",
+    )
 
 
 class ForecastSearchStartRequest(BaseModel):
@@ -104,6 +108,17 @@ class ForecastSearchStartRequest(BaseModel):
     requiredFeatures: Optional[List[str]] = Field(None, description="Required features for every solution")
     configPath: Optional[str] = Field(None, description="Path to forecast_search.yaml")
     onlyFeedback: Optional[bool] = Field(False, description="If true, only generate feedback from existing outputs")
+
+
+class ForecastQaRequest(BaseModel):
+    """Request to ask LLM about forecast result table."""
+    outputDir: str = Field(..., description="Forecast output root directory")
+    model: Optional[str] = Field(None, description="Backend model name")
+    query: str = Field(..., description="User question about forecast results")
+    selectedFeatures: Optional[List[str]] = Field(
+        None,
+        description="Frontend selected features for current model",
+    )
 
 
 class SystemConfigUpdate(BaseModel):
@@ -152,7 +167,7 @@ def _load_dotenv_dict() -> Dict[str, str]:
     """Parse the .env file into a dict (simple key=value, ignoring comments)."""
     env: Dict[str, str] = {}
     if DOTENV_PATH.exists():
-        for line in DOTENV_PATH.read_text().splitlines():
+        for line in DOTENV_PATH.read_text(encoding="utf-8").splitlines():
             stripped = line.strip()
             if not stripped or stripped.startswith("#"):
                 continue
@@ -1120,6 +1135,216 @@ def _load_backtest_results(task: Dict[str, Any]):
         traceback.print_exc()  # print for debugging, but don't crash
 
 
+# ---- Weather (ECMWF CSV) endpoints ----
+
+WEATHER_DIR = PROJECT_ROOT / "data" / "weather"
+
+WEATHER_DATA_SOURCE = {
+    "title": "Seasonal forecast daily and subdaily data on single levels",
+    "dataset": "seasonal-original-single-levels",
+    "url": "https://cds.climate.copernicus.eu/",
+    "variable": "2m 温度",
+    "step": "6 小时",
+    "horizon": "最长约 7 个月（215 天）",
+    "initDate": "2026-05-01",
+    "area": "河北代表框（石家庄附近，AREA=[39,113,37,116]）",
+    "gridNote": "下载为小区域网格（约 2×3 格点），展示时取距 (38.04°N, 114.51°E) 最近格点；温度展示按集合成员求平均",
+}
+
+
+def _resolve_weather_file(filename: str) -> Path:
+    if not filename or ".." in filename or "/" in filename or "\\" in filename:
+        raise HTTPException(status_code=400, detail="非法文件名")
+    path = (WEATHER_DIR / filename).resolve()
+    root = WEATHER_DIR.resolve()
+    if not str(path).startswith(str(root)):
+        raise HTTPException(status_code=403, detail="路径不允许")
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail=f"文件不存在: {filename}")
+    return path
+
+
+def _parse_bj_datetime(series: "pd.Series") -> "pd.Series":
+    import pandas as pd
+
+    return pd.to_datetime(series, errors="coerce")
+
+
+@app.get("/api/v1/weather/files", response_model=ApiResponse)
+async def list_weather_files():
+    """List preview (6h) and daily CSV files under data/weather/."""
+    preview_files: List[str] = []
+    daily_files: List[str] = []
+    if WEATHER_DIR.is_dir():
+        preview_files = sorted(p.name for p in WEATHER_DIR.glob("*_preview.csv"))
+        daily_files = sorted(
+            p.name
+            for p in WEATHER_DIR.glob("hebei_ecmwf_s5_daily_temperature_*.csv")
+        )
+    return ApiResponse(
+        success=True,
+        data={
+            "previewFiles": preview_files,
+            "dailyFiles": daily_files,
+            "dataSource": WEATHER_DATA_SOURCE,
+            "weatherDir": str(WEATHER_DIR),
+        },
+    )
+
+
+@app.get("/api/v1/weather/preview/meta", response_model=ApiResponse)
+async def weather_preview_meta(file: str = Query(..., description="*_preview.csv 文件名")):
+    """Return available Beijing date/hour slots for a preview CSV."""
+    import pandas as pd
+
+    path = _resolve_weather_file(file)
+    df = pd.read_csv(path)
+    cols = [
+        c
+        for c in ("valid_time_bj", "latitude", "longitude", "number", "realization", "ensemble_member")
+        if c in df.columns
+    ]
+    df = df[cols] if cols else df
+    if "valid_time_bj" not in df.columns:
+        raise HTTPException(status_code=400, detail="CSV 缺少 valid_time_bj 列")
+
+    ts = _parse_bj_datetime(df["valid_time_bj"])
+    df = df.assign(
+        date_bj=ts.dt.strftime("%Y-%m-%d"),
+        hour_bj=ts.dt.hour,
+    )
+    slots = (
+        df[["date_bj", "hour_bj"]]
+        .dropna()
+        .drop_duplicates()
+        .sort_values(["date_bj", "hour_bj"])
+    )
+    dates = sorted(slots["date_bj"].unique().tolist())
+    hours_by_date: Dict[str, List[int]] = {}
+    for d in dates:
+        hours_by_date[d] = slots.loc[slots["date_bj"] == d, "hour_bj"].astype(int).tolist()
+
+    lat = float(df["latitude"].iloc[0]) if "latitude" in df.columns and len(df) else None
+    lon = float(df["longitude"].iloc[0]) if "longitude" in df.columns and len(df) else None
+    member_col = next((c for c in ("number", "realization", "ensemble_member") if c in df.columns), None)
+    members: List[int] = []
+    if member_col is not None:
+        members = sorted(int(x) for x in df[member_col].dropna().unique())
+
+    return ApiResponse(
+        success=True,
+        data={
+            "file": file,
+            "dates": dates,
+            "hoursByDate": hours_by_date,
+            "gridLatitude": lat,
+            "gridLongitude": lon,
+            "rowCount": len(df),
+            "members": members,
+        },
+    )
+
+
+@app.get("/api/v1/weather/preview/value", response_model=ApiResponse)
+async def weather_preview_value(
+    file: str = Query(...),
+    date_bj: str = Query(..., description="YYYY-MM-DD"),
+    hour_bj: int = Query(..., ge=0, le=23),
+    member: Optional[int] = Query(None, description="可选成员编号；不传则为集合平均"),
+):
+    """6h preview temperature (°C) at selected Beijing date/hour."""
+    import pandas as pd
+
+    path = _resolve_weather_file(file)
+    df = pd.read_csv(path)
+    if "valid_time_bj" not in df.columns:
+        raise HTTPException(status_code=400, detail="CSV 缺少 valid_time_bj")
+
+    ts = _parse_bj_datetime(df["valid_time_bj"])
+    mask = (ts.dt.strftime("%Y-%m-%d") == date_bj) & (ts.dt.hour == hour_bj)
+    sub = df.loc[mask]
+    if sub.empty:
+        return ApiResponse(
+            success=False,
+            error=f"未找到 {date_bj} {hour_bj:02d}:00（北京时间）的记录",
+        )
+
+    row0 = sub.iloc[0]
+    has_agg_cols = {"temp_mean_c", "temp_p10_c", "temp_p50_c", "temp_p90_c"}.issubset(set(sub.columns))
+    if has_agg_cols:
+        temp_mean = float(row0["temp_mean_c"])
+        temp_p10 = float(row0["temp_p10_c"])
+        temp_p50 = float(row0["temp_p50_c"])
+        temp_p90 = float(row0["temp_p90_c"])
+        member_count = int(row0["member_count"]) if "member_count" in sub.columns and not pd.isna(row0["member_count"]) else 51
+    else:
+        if "t2m_c" not in sub.columns:
+            raise HTTPException(status_code=400, detail="CSV 缺少温度列")
+        temps = sub["t2m_c"].astype(float)
+        temp_mean = float(temps.mean())
+        temp_p10 = float(temps.quantile(0.10))
+        temp_p50 = float(temps.quantile(0.50))
+        temp_p90 = float(temps.quantile(0.90))
+        member_col = next((c for c in ("number", "realization", "ensemble_member") if c in sub.columns), None)
+        member_count = int(sub[member_col].nunique()) if member_col else 1
+
+    return ApiResponse(
+        success=True,
+        data={
+            "dateBj": date_bj,
+            "hourBj": hour_bj,
+            "temperatureC": round(temp_mean, 2),
+            "aggMode": "mean",
+            "member": None,
+            "memberCount": member_count,
+            "sampleCount": int(len(sub)),
+            "tempMinC": round(temp_p10, 2),
+            "tempMaxC": round(temp_p90, 2),
+            "tempP10C": round(temp_p10, 2),
+            "tempP50C": round(temp_p50, 2),
+            "tempP90C": round(temp_p90, 2),
+            "validTimeUtc": str(row0["valid_time_utc"]) if "valid_time_utc" in sub.columns else None,
+            "validTimeBj": str(row0["valid_time_bj"]) if "valid_time_bj" in sub.columns else None,
+        },
+    )
+
+
+@app.get("/api/v1/weather/daily", response_model=ApiResponse)
+async def weather_daily_data(file: str = Query(..., description="hebei_ecmwf_s5_daily_temperature_*.csv")):
+    """Load daily aggregated CSV (small) for date picker."""
+    import pandas as pd
+
+    path = _resolve_weather_file(file)
+    df = pd.read_csv(path)
+    date_col = "date_bj" if "date_bj" in df.columns else df.columns[0]
+    df[date_col] = df[date_col].astype(str)
+    temp_col = "temp_mean_c" if "temp_mean_c" in df.columns else ("temp_c" if "temp_c" in df.columns else "t2m_c")
+    if temp_col not in df.columns:
+        raise HTTPException(status_code=400, detail="CSV 缺少 temp_c / temp_mean_c 列")
+
+    rows = []
+    for _, r in df.iterrows():
+        row: Dict[str, Any] = {
+            "dateBj": str(r[date_col])[:10],
+            "tempMeanC": round(float(r[temp_col]), 2),
+        }
+        for src, key in (
+            ("temp_p10_c", "tempP10C"),
+            ("temp_p50_c", "tempP50C"),
+            ("temp_p90_c", "tempP90C"),
+        ):
+            if src in df.columns and pd.notna(r.get(src)):
+                row[key] = round(float(r[src]), 2)
+            else:
+                row[key] = row["tempMeanC"]
+        rows.append(row)
+
+    return ApiResponse(
+        success=True,
+        data={"file": file, "rows": rows, "tempColumn": temp_col},
+    )
+
+
 # ---- Forecast endpoints ----
 
 @app.post("/api/v1/forecast/start", response_model=ApiResponse)
@@ -1184,6 +1409,71 @@ async def cancel_forecast(task_id: str):
         "timestamp": _now(),
     })
     return ApiResponse(success=True, message="燃气预测已取消")
+
+
+def _load_feature_cols_used_for_model(out_root: Path, model: str) -> list[str]:
+    summary = out_root / model / f"{model}_best_summary.json"
+    if not summary.exists():
+        return []
+    try:
+        raw = json.loads(summary.read_text(encoding="utf-8"))
+        cols = raw.get("feature_cols_used")
+        if isinstance(cols, list):
+            return [str(c) for c in cols]
+    except Exception:
+        return []
+    return []
+
+
+@app.post("/api/v1/forecast/qa", response_model=ApiResponse)
+async def ask_forecast_qa(req: ForecastQaRequest):
+    """Ask LLM questions based on forecast result table (pred vs actual)."""
+    try:
+        # Ensure .env values are visible for this process path too (not only child subprocesses).
+        os.environ.update(_load_dotenv_dict())
+
+        out = Path(req.outputDir)
+        if not out.is_absolute():
+            out = PROJECT_ROOT / out
+
+        model = (req.model or "").strip().lower()
+        if not model:
+            raise HTTPException(status_code=400, detail="model 不能为空")
+
+        model_dir = out / model
+        table_rows = _load_forecast_test_points_for_ui(model_dir, model)
+        if not table_rows:
+            curve = _load_forecast_curve_for_ui(model_dir, model)
+            table_rows = [
+                {"ds": r.get("ds"), "period": "", "yhat": r.get("yhat"), "y": r.get("y"), "error_pct": None}
+                for r in curve
+                if isinstance(r, dict)
+            ]
+        if not table_rows:
+            raise HTTPException(status_code=404, detail=f"未找到可问答的预测结果文件: {model_dir}")
+
+        from quantaalpha.app.utils.forecast_qa import generate_forecast_qa_answer
+
+        result = generate_forecast_qa_answer(
+            query=req.query,
+            rows=table_rows,
+            feature_cols_used=_load_feature_cols_used_for_model(out, model),
+            selected_features=list(req.selectedFeatures or []),
+        )
+        return ApiResponse(
+            success=True,
+            data={
+                "answer": result.get("answer", ""),
+                "modelUsed": result.get("model_used", ""),
+                "rowsUsed": result.get("rows_used", 0),
+                "dataMode": result.get("data_mode", "pred_only"),
+                "featureColsUsed": result.get("feature_cols_used", []),
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"LLM 问答失败: {exc}") from exc
 
 
 # ---- Forecast Search endpoints ----
@@ -1529,6 +1819,8 @@ async def _run_forecast(
             cmd.extend(["--selection-metric", req.selectionMetric])
         if req.timesfmDevice:
             cmd.extend(["--timesfm-device", req.timesfmDevice])
+        if req.modelFeatures:
+            cmd.extend(["--model-features-json", json.dumps(req.modelFeatures, ensure_ascii=False)])
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -1702,6 +1994,24 @@ def _load_forecast_curve_for_ui(model_dir: Path, model_name: str) -> list[dict[s
     return [{"ds": str(r["ds"])[:10], "yhat": float(r["yhat"])} for r in forecast_df.to_dict(orient="records")]
 
 
+def _resolve_forecast_summary_path(out: Path, model: str) -> Path | None:
+    """Pick summary JSON for UI: explicit model first, then auto aggregate."""
+    if model and model != "auto":
+        per_model = out / model / f"{model}_best_summary.json"
+        if per_model.exists():
+            return per_model
+    for candidate in (
+        out / "forecast_result.json",
+        out / "model_selection_summary.json",
+    ):
+        if candidate.exists():
+            return candidate
+    if model and model != "auto":
+        per_model = out / model / f"{model}_best_summary.json"
+        return per_model if per_model.exists() else None
+    return None
+
+
 def _load_forecast_results(task: Dict[str, Any], output_dir: str, model: str):
     """Load forecast summary JSON and optional forecast curve for the UI."""
     try:
@@ -1709,14 +2019,10 @@ def _load_forecast_results(task: Dict[str, Any], output_dir: str, model: str):
         if not out.is_absolute():
             out = PROJECT_ROOT / out
 
-        summary_path = out / "forecast_result.json"
-        if not summary_path.exists():
-            summary_path = out / "model_selection_summary.json"
-        if not summary_path.exists() and model and model != "auto":
-            summary_path = out / model / f"{model}_best_summary.json"
+        summary_path = _resolve_forecast_summary_path(out, model)
 
         metrics: Dict[str, Any] = {}
-        if summary_path.exists():
+        if summary_path and summary_path.exists():
             with open(summary_path, "r", encoding="utf-8") as f:
                 raw = json.load(f)
             if raw.get("best_result"):
@@ -1728,6 +2034,8 @@ def _load_forecast_results(task: Dict[str, Any], output_dir: str, model: str):
                     {
                         "backend": c.get("backend"),
                         "test_metrics": c.get("test_metrics", {}),
+                        "feature_cols_used": c.get("feature_cols_used")
+                        or (c.get("outputs") or {}).get("feature_cols_used"),
                     }
                     for c in raw.get("candidates", [])
                 ]
@@ -1736,13 +2044,17 @@ def _load_forecast_results(task: Dict[str, Any], output_dir: str, model: str):
                 metrics["test_metrics"] = raw.get("test_metrics") or raw.get("raw", {}).get(
                     "test_metrics", {}
                 )
+                metrics["feature_set"] = raw.get("feature_set")
+                metrics["feature_cols_used"] = raw.get("feature_cols_used")
 
-        best_model = metrics.get("best_model") or model
-        if best_model and best_model != "auto_select":
-            model_dir = out / str(best_model)
-            curve = _load_forecast_curve_for_ui(model_dir, str(best_model))
+        # 曲线：UI 选了具体模型时优先该模型目录，避免仍显示 auto 比选的最优模型
+        display_model = model if model and model != "auto" else metrics.get("best_model")
+        if display_model and display_model not in ("auto", "auto_select"):
+            model_dir = out / str(display_model)
+            curve = _load_forecast_curve_for_ui(model_dir, str(display_model))
             if curve:
                 metrics["forecast_curve"] = curve
+            metrics["display_model"] = display_model
 
         task["metrics"] = metrics
     except Exception:

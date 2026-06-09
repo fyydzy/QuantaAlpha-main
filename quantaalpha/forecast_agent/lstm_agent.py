@@ -22,6 +22,7 @@ from quantaalpha.forecast_agent.data import (
     forecast_metrics,
     format_month_ds_for_display,
     filter_through_period,
+    feature_set_from_task,
     load_tabular_feature_frame,
     load_task_context,
     period_to_lstm_slot,
@@ -138,14 +139,23 @@ def _apply_context_window(df: pd.DataFrame, context_len: int) -> pd.DataFrame:
     return df.iloc[-context_len:].copy()
 
 
+def _lstm_feature_cols(feature_set: list[str] | None) -> list[str]:
+    if not feature_set:
+        return list(SELECTED_FEATURES)
+    return list(feature_set)
+
+
 def _prepare_lstm_frames(
     ctx: TaskContext,
     params: LstmHyperParams,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, list[str]]:
+    *,
+    feature_set: list[str] | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, list[str], list[str]]:
     path = str(ctx.metadata["excel_path"])
     feature_df = _load_feature_frame(path)
+    lstm_cols = _lstm_feature_cols(feature_set)
 
-    missing_features = [f for f in SELECTED_FEATURES if f not in feature_df.columns]
+    missing_features = [f for f in lstm_cols if f not in feature_df.columns]
     if missing_features:
         raise ValueError(f"特征工程后缺少 LSTM 所需特征: {missing_features}")
 
@@ -164,7 +174,7 @@ def _prepare_lstm_frames(
     if len(work_df) < SEQ_LENGTH + len(ctx.forecast_months):
         raise ValueError("work_df 过短，无法构造预测序列。")
 
-    return feature_df, train_ctx, work_df, list(ctx.forecast_months)
+    return feature_df, train_ctx, work_df, list(ctx.forecast_months), lstm_cols
 
 
 def _create_3d_sequences(
@@ -196,6 +206,7 @@ def _train_lstm(
     train_ctx: pd.DataFrame,
     work_df: pd.DataFrame,
     forecast_months: list[str],
+    lstm_cols: list[str],
 ) -> tuple[Any, StandardScaler, StandardScaler, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """与随机森林一致：仅使用 as_of 之后再经 context_len 截窗的 train_ctx。
     StandardScaler 仅在 train_ctx 所含旬对应的行上 fit；LSTM 仅用「预测目标旬落在 train_ctx」的序列做训练。
@@ -207,7 +218,7 @@ def _train_lstm(
     torch.manual_seed(RANDOM_SEED)
 
     month_arr = work_df[MONTH_COL].astype(str).to_numpy()
-    x_cont_all = work_df[SELECTED_FEATURES].to_numpy(dtype=float)
+    x_cont_all = work_df[lstm_cols].to_numpy(dtype=float)
     x_month_all = work_df["period_slot"].to_numpy(dtype=np.int64)
     y_all = work_df[TARGET_COL].to_numpy(dtype=float)
 
@@ -246,7 +257,7 @@ def _train_lstm(
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
 
     model = LSTMCls(
-        continuous_size=len(SELECTED_FEATURES),
+        continuous_size=len(lstm_cols),
         hidden_size=HIDDEN_SIZE,
         num_layers=NUM_LAYERS,
         emb_dim=EMBEDDING_DIM,
@@ -321,8 +332,12 @@ class LstmEvaluator(ForecastEvaluator):
         params: LstmHyperParams = subjects.params  # type: ignore[assignment]
         self._last_bundle = None
         try:
-            _feature_df, train_ctx, work_df, forecast_months = _prepare_lstm_frames(ctx, params)
-            model, scaler_x, scaler_y, x3, xm3, y1, ym = _train_lstm(train_ctx, work_df, forecast_months)
+            _feature_df, train_ctx, work_df, forecast_months, lstm_cols = _prepare_lstm_frames(
+                ctx, params, feature_set=feature_set_from_task(task)
+            )
+            model, scaler_x, scaler_y, x3, xm3, y1, ym = _train_lstm(
+                train_ctx, work_df, forecast_months, lstm_cols
+            )
             self._last_bundle = (_state_dict_cpu(model), scaler_x, scaler_y)
 
             yhat = _predict_future(model, scaler_x, scaler_y, work_df, ym, x3, xm3, y1, forecast_months)
@@ -431,21 +446,24 @@ class AutoLstmForecastAgent(ForecastAgent):
     def refit_and_forecast(self, task: ForecastTask, params: LstmHyperParams) -> dict[str, Any]:
         LSTMCls = _build_lstm_module_class()
         ctx = load_task_context(task)
-        _feature_df, train_ctx, work_df, forecast_months = _prepare_lstm_frames(ctx, params)
+        fs = feature_set_from_task(task)
+        _feature_df, train_ctx, work_df, forecast_months, lstm_cols = _prepare_lstm_frames(
+            ctx, params, feature_set=fs
+        )
 
         ev = self.evaluator
         bundle = getattr(ev, "_last_bundle", None) if isinstance(ev, LstmEvaluator) else None
         if bundle is not None:
             state_d, scaler_x, scaler_y = bundle
             model = LSTMCls(
-                continuous_size=len(SELECTED_FEATURES),
+                continuous_size=len(lstm_cols),
                 hidden_size=HIDDEN_SIZE,
                 num_layers=NUM_LAYERS,
                 emb_dim=EMBEDDING_DIM,
             )
             model.load_state_dict(state_d)
             month_arr = work_df[MONTH_COL].astype(str).to_numpy()
-            x_cont_all = work_df[SELECTED_FEATURES].to_numpy(dtype=float)
+            x_cont_all = work_df[lstm_cols].to_numpy(dtype=float)
             x_month_all = work_df["period_slot"].to_numpy(dtype=np.int64)
             y_all = work_df[TARGET_COL].to_numpy(dtype=float)
             x_cont_scaled = scaler_x.transform(x_cont_all)
@@ -455,7 +473,9 @@ class AutoLstmForecastAgent(ForecastAgent):
             )
             yhat = _predict_future(model, scaler_x, scaler_y, work_df, ym, x3, xm3, y1, forecast_months)
         else:
-            model, scaler_x, scaler_y, x3, xm3, y1, ym = _train_lstm(train_ctx, work_df, forecast_months)
+            model, scaler_x, scaler_y, x3, xm3, y1, ym = _train_lstm(
+                train_ctx, work_df, forecast_months, lstm_cols
+            )
             yhat = _predict_future(model, scaler_x, scaler_y, work_df, ym, x3, xm3, y1, forecast_months)
 
         forecast_df = pd.DataFrame({"ds": ctx.future_index, "yhat": yhat})
@@ -463,8 +483,10 @@ class AutoLstmForecastAgent(ForecastAgent):
             "series": ctx.series,
             "forecast_df": forecast_df,
             "ctx": ctx,
+            "feature_set": fs,
+            "feature_cols_used": list(lstm_cols),
             "lstm_config": {
-                "selected_features": list(SELECTED_FEATURES),
+                "selected_features": list(lstm_cols),
                 "seq_length": SEQ_LENGTH,
                 "hidden_size": HIDDEN_SIZE,
                 "num_layers": NUM_LAYERS,
@@ -520,6 +542,8 @@ class AutoLstmForecastAgent(ForecastAgent):
             "trace_size": len(self.trace),
             "test_metrics": forecast_metrics(y_true, y_pred),
             "lstm_config": final_result.get("lstm_config", {}),
+            "feature_set": final_result.get("feature_set", list(getattr(task, "feature_set", []) or [])),
+            "feature_cols_used": final_result.get("feature_cols_used", []),
             result_path_key: str(result_path),
         }
         summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2, default=str), encoding="utf-8")

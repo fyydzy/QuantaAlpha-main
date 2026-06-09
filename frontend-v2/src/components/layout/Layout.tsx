@@ -1,11 +1,12 @@
 import React from 'react';
-import { Sparkles, Database, BarChart3, Flame, Settings as SettingsIcon, Search } from 'lucide-react';
+import { Sparkles, /* Database, BarChart3, */ Flame, Settings as SettingsIcon, Search, CloudSun } from 'lucide-react';
 import { useTaskContext } from '@/context/TaskContext';
 
 export type PageId =
   | 'home'
   | 'library'
   | 'backtest'
+  | 'weather'
   | 'forecast'
   | 'forecast_search'
   | 'settings'
@@ -42,11 +43,12 @@ export const Layout: React.FC<LayoutProps> = ({
   };
 
   const navItems = [
-    { id: 'home' as const, label: '因子挖掘', icon: Sparkles },
-    { id: 'library' as const, label: '因子库', icon: Database },
-    { id: 'backtest' as const, label: '回测', icon: BarChart3 },
-    { id: 'forecast' as const, label: '燃气预测', icon: Flame },
+    // { id: 'home' as const, label: '因子挖掘', icon: Sparkles },
+    // { id: 'library' as const, label: '因子库', icon: Database },
+    // { id: 'backtest' as const, label: '回测', icon: BarChart3 },
+    { id: 'weather' as const, label: '天气预测', icon: CloudSun },
     { id: 'forecast_search' as const, label: '特征方案搜索', icon: Search },
+    { id: 'forecast' as const, label: '燃气预测', icon: Flame },
     { id: 'settings' as const, label: '设置', icon: SettingsIcon },
   ];
 
@@ -58,7 +60,7 @@ export const Layout: React.FC<LayoutProps> = ({
           <div className="flex items-center justify-between">
             <div 
               className="flex items-center gap-3 cursor-pointer hover:opacity-80 transition-opacity"
-              onClick={() => onNavigate('home')}
+              onClick={() => onNavigate('forecast')}
             >
               <div className="relative">
                 <div className="relative flex h-12 w-12 items-center justify-center rounded-xl bg-gradient-to-br from-primary to-purple-600">
