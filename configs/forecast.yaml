@@ -23,48 +23,6 @@ model: auto
 candidate_models: sarimax,lasso,elasticnet,ridge,lstm,xgboost,lightgbm,catboost,random_forest
 
 # ---------------------------------------------------------------------------
-# tabular 模型共用可选列（lasso / elasticnet / ridge / xgboost / lightgbm / catboost / random_forest）
-# 来源：feature_engineering.build_features_pipeline + FEATURE_REGISTRY
-# 不可用列：date、month、gas_sales（目标列，不会作为特征）
-# ---------------------------------------------------------------------------
-#   - avg_temp                      # 旬平均气温
-#   - max_temp                      # 旬最高气温
-#   - min_temp                      # 旬最低气温
-#   - temp_range                    # 旬最高温与最低温之差
-#   - HDD                           # 采暖度日
-#   - extreme_cold_days             # 旬内极端寒冷日数量
-#   - time_index                    # 长期趋势项
-#   - month_sin                     # 年度周期正弦
-#   - month_cos                     # 年度周期余弦
-#   - ten_sin                       # 旬度周期正弦
-#   - ten_cos                       # 旬度周期余弦
-#   - is_heating_season             # 是否供暖季（11,12,1,2,3 月）
-#   - Lag_36                        # 同比滞后销量（上一年同旬）
-#   - HDD_squared                   # HDD 平方项
-#   - HDD_cross_Lag_36              # 低温 × 同比销量
-#   - HDD_cross_HeatingSeason       # 低温 × 供暖季
-#   - ColdDays_cross_Lag_36         # 极端寒冷日 × 同比销量
-#   - spring_rework_peak            # 春节后复工峰值
-#   - HDD_cross_spring_rework_peak  # 低温 × 复工峰值
-
-# ---------------------------------------------------------------------------
-# SARIMAX 可选外生列（仅天气相关，与 SARIMAX_EXOG_COLS 一致）
-# ---------------------------------------------------------------------------
-#   - avg_temp
-#   - max_temp
-#   - min_temp
-#   - HDD
-#   - extreme_cold_days
-#   - temp_range
-
-# ---------------------------------------------------------------------------
-# LSTM 可选连续特征（仅下列 3 列的子集；默认即此三列）
-# ---------------------------------------------------------------------------
-#   - Lag_36
-#   - HDD
-#   - is_heating_season
-
-# ---------------------------------------------------------------------------
 # 按模型启用特征（下面各段默认全部注释 = 使用默认全集/硬编码）
 # ---------------------------------------------------------------------------
 model_features:

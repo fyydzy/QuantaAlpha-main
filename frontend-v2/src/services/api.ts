@@ -256,6 +256,21 @@ export interface ForecastStartParams {
   modelFeatures?: Record<string, string[]>;
 }
 
+export interface ForecastQaParams {
+  outputDir: string;
+  model: string;
+  query: string;
+  selectedFeatures?: string[];
+}
+
+export interface ForecastQaResponse {
+  answer: string;
+  modelUsed: string;
+  rowsUsed: number;
+  dataMode: 'test_only' | 'pred_only';
+  featureColsUsed: string[];
+}
+
 export async function startForecast(params: ForecastStartParams) {
   return request<{ taskId: string; task: Task }>('/api/v1/forecast/start', {
     method: 'POST',
@@ -269,6 +284,13 @@ export async function getForecastStatus(taskId: string) {
 
 export async function cancelForecast(taskId: string) {
   return request(`/api/v1/forecast/${taskId}`, { method: 'DELETE' });
+}
+
+export async function askForecastQa(params: ForecastQaParams) {
+  return request<ForecastQaResponse>('/api/v1/forecast/qa', {
+    method: 'POST',
+    body: JSON.stringify(params),
+  });
 }
 
 // ========================== Forecast Search API ==========================

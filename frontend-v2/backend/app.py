@@ -110,6 +110,17 @@ class ForecastSearchStartRequest(BaseModel):
     onlyFeedback: Optional[bool] = Field(False, description="If true, only generate feedback from existing outputs")
 
 
+class ForecastQaRequest(BaseModel):
+    """Request to ask LLM about forecast result table."""
+    outputDir: str = Field(..., description="Forecast output root directory")
+    model: Optional[str] = Field(None, description="Backend model name")
+    query: str = Field(..., description="User question about forecast results")
+    selectedFeatures: Optional[List[str]] = Field(
+        None,
+        description="Frontend selected features for current model",
+    )
+
+
 class SystemConfigUpdate(BaseModel):
     """Partial update to system configuration (.env)."""
     QLIB_DATA_DIR: Optional[str] = None
@@ -1398,6 +1409,71 @@ async def cancel_forecast(task_id: str):
         "timestamp": _now(),
     })
     return ApiResponse(success=True, message="燃气预测已取消")
+
+
+def _load_feature_cols_used_for_model(out_root: Path, model: str) -> list[str]:
+    summary = out_root / model / f"{model}_best_summary.json"
+    if not summary.exists():
+        return []
+    try:
+        raw = json.loads(summary.read_text(encoding="utf-8"))
+        cols = raw.get("feature_cols_used")
+        if isinstance(cols, list):
+            return [str(c) for c in cols]
+    except Exception:
+        return []
+    return []
+
+
+@app.post("/api/v1/forecast/qa", response_model=ApiResponse)
+async def ask_forecast_qa(req: ForecastQaRequest):
+    """Ask LLM questions based on forecast result table (pred vs actual)."""
+    try:
+        # Ensure .env values are visible for this process path too (not only child subprocesses).
+        os.environ.update(_load_dotenv_dict())
+
+        out = Path(req.outputDir)
+        if not out.is_absolute():
+            out = PROJECT_ROOT / out
+
+        model = (req.model or "").strip().lower()
+        if not model:
+            raise HTTPException(status_code=400, detail="model 不能为空")
+
+        model_dir = out / model
+        table_rows = _load_forecast_test_points_for_ui(model_dir, model)
+        if not table_rows:
+            curve = _load_forecast_curve_for_ui(model_dir, model)
+            table_rows = [
+                {"ds": r.get("ds"), "period": "", "yhat": r.get("yhat"), "y": r.get("y"), "error_pct": None}
+                for r in curve
+                if isinstance(r, dict)
+            ]
+        if not table_rows:
+            raise HTTPException(status_code=404, detail=f"未找到可问答的预测结果文件: {model_dir}")
+
+        from quantaalpha.app.utils.forecast_qa import generate_forecast_qa_answer
+
+        result = generate_forecast_qa_answer(
+            query=req.query,
+            rows=table_rows,
+            feature_cols_used=_load_feature_cols_used_for_model(out, model),
+            selected_features=list(req.selectedFeatures or []),
+        )
+        return ApiResponse(
+            success=True,
+            data={
+                "answer": result.get("answer", ""),
+                "modelUsed": result.get("model_used", ""),
+                "rowsUsed": result.get("rows_used", 0),
+                "dataMode": result.get("data_mode", "pred_only"),
+                "featureColsUsed": result.get("feature_cols_used", []),
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"LLM 问答失败: {exc}") from exc
 
 
 # ---- Forecast Search endpoints ----

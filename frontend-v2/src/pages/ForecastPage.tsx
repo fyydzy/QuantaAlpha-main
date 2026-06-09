@@ -22,6 +22,7 @@ import {
 } from 'recharts';
 import { useTaskContext } from '@/context/TaskContext';
 import { formatNumber } from '@/utils';
+import { askForecastQa } from '@/services/api';
 
 const MODEL_OPTIONS = [
   { value: 'auto', label: '自动比选 (auto)' },
@@ -34,7 +35,6 @@ const MODEL_OPTIONS = [
   { value: 'catboost', label: 'CatBoost' },
   { value: 'random_forest', label: 'Random Forest' },
   { value: 'sarimax', label: 'SARIMAX' },
-  { value: 'timesfm', label: 'TimesFM' },
 ];
 
 const TABULAR_FEATURE_OPTIONS = [
@@ -71,6 +71,143 @@ const FEATURE_OPTIONS_BY_MODEL: Record<string, string[]> = {
   lstm: ['Lag_36', 'HDD', 'is_heating_season'],
 };
 
+function renderInlineMarkdown(text: string, keyPrefix: string): React.ReactNode {
+  const parts = text.split(/(`[^`]+`|\*\*[^*]+\*\*)/g).filter(Boolean);
+  return parts.map((part, idx) => {
+    if (part.startsWith('`') && part.endsWith('`')) {
+      return (
+        <code
+          key={`${keyPrefix}-code-${idx}`}
+          className="px-1.5 py-0.5 rounded bg-black/30 text-amber-300 text-xs"
+        >
+          {part.slice(1, -1)}
+        </code>
+      );
+    }
+    if (part.startsWith('**') && part.endsWith('**')) {
+      return (
+        <strong key={`${keyPrefix}-strong-${idx}`} className="font-semibold text-foreground">
+          {part.slice(2, -2)}
+        </strong>
+      );
+    }
+    return <React.Fragment key={`${keyPrefix}-text-${idx}`}>{part}</React.Fragment>;
+  });
+}
+
+function renderMarkdownLike(answer: string): React.ReactNode {
+  const nodes: React.ReactNode[] = [];
+  const chunks = answer.split(/```/);
+  let listBuffer: { type: 'ul' | 'ol'; items: string[] } | null = null;
+
+  const flushList = (keyBase: string) => {
+    if (!listBuffer || listBuffer.items.length === 0) return;
+    if (listBuffer.type === 'ul') {
+      nodes.push(
+        <ul key={`${keyBase}-ul`} className="list-disc pl-5 space-y-1">
+          {listBuffer.items.map((it, i) => (
+            <li key={`${keyBase}-uli-${i}`} className="text-sm leading-6">
+              {renderInlineMarkdown(it, `${keyBase}-uli-${i}`)}
+            </li>
+          ))}
+        </ul>,
+      );
+    } else {
+      nodes.push(
+        <ol key={`${keyBase}-ol`} className="list-decimal pl-5 space-y-1">
+          {listBuffer.items.map((it, i) => (
+            <li key={`${keyBase}-oli-${i}`} className="text-sm leading-6">
+              {renderInlineMarkdown(it, `${keyBase}-oli-${i}`)}
+            </li>
+          ))}
+        </ol>,
+      );
+    }
+    listBuffer = null;
+  };
+
+  chunks.forEach((chunk, chunkIdx) => {
+    const keyBase = `md-${chunkIdx}`;
+    // odd chunk index = code block content
+    if (chunkIdx % 2 === 1) {
+      flushList(`${keyBase}-before-code`);
+      const codeText = chunk.replace(/^\s*\n/, '').replace(/\n\s*$/, '');
+      nodes.push(
+        <pre
+          key={`${keyBase}-code`}
+          className="overflow-x-auto rounded-lg bg-black/40 border border-border p-3 text-xs text-slate-100 leading-6"
+        >
+          <code>{codeText}</code>
+        </pre>,
+      );
+      return;
+    }
+
+    const lines = chunk.split('\n');
+    lines.forEach((rawLine, lineIdx) => {
+      const line = rawLine.trim();
+      const lineKey = `${keyBase}-line-${lineIdx}`;
+      if (!line) {
+        // Keep current list across blank lines; many LLM outputs place an empty line
+        // between numbered items, and flushing here would restart numbering at 1.
+        if (!listBuffer) {
+          flushList(`${lineKey}-blank`);
+        }
+        return;
+      }
+
+      const ulMatch = line.match(/^[-*]\s+(.+)$/);
+      if (ulMatch) {
+        if (!listBuffer || listBuffer.type !== 'ul') {
+          flushList(`${lineKey}-switch-ul`);
+          listBuffer = { type: 'ul', items: [] };
+        }
+        listBuffer.items.push(ulMatch[1]);
+        return;
+      }
+
+      const olMatch = line.match(/^\d+\.\s+(.+)$/);
+      if (olMatch) {
+        if (!listBuffer || listBuffer.type !== 'ol') {
+          flushList(`${lineKey}-switch-ol`);
+          listBuffer = { type: 'ol', items: [] };
+        }
+        listBuffer.items.push(olMatch[1]);
+        return;
+      }
+
+      flushList(`${lineKey}-before-text`);
+
+      const heading = line.match(/^(#{1,3})\s+(.+)$/);
+      if (heading) {
+        const level = heading[1].length;
+        const title = heading[2];
+        const cls =
+          level === 1
+            ? 'text-base font-semibold'
+            : level === 2
+              ? 'text-sm font-semibold'
+              : 'text-sm font-medium';
+        nodes.push(
+          <div key={`${lineKey}-h`} className={`${cls} text-foreground mt-1`}>
+            {renderInlineMarkdown(title, `${lineKey}-h`)}
+          </div>,
+        );
+        return;
+      }
+
+      nodes.push(
+        <p key={`${lineKey}-p`} className="text-sm leading-6 text-foreground/90">
+          {renderInlineMarkdown(line, `${lineKey}-p`)}
+        </p>,
+      );
+    });
+  });
+
+  flushList('md-end');
+  return <div className="space-y-2">{nodes}</div>;
+}
+
 export const ForecastPage: React.FC = () => {
   const {
     backendAvailable,
@@ -88,6 +225,11 @@ export const ForecastPage: React.FC = () => {
   const [contextLen, setContextLen] = useState(270);
   const [selectedFeatures, setSelectedFeatures] = useState<string[]>([]);
   const [isStarting, setIsStarting] = useState(false);
+  const [qaQuery, setQaQuery] = useState('');
+  const [qaAnswer, setQaAnswer] = useState('');
+  const [qaError, setQaError] = useState('');
+  const [qaLoading, setQaLoading] = useState(false);
+  const [qaMeta, setQaMeta] = useState<{ modelUsed: string; rowsUsed: number; dataMode: string } | null>(null);
   const logsEndRef = useRef<HTMLDivElement>(null);
   const modelFeatureOptions = FEATURE_OPTIONS_BY_MODEL[model] || [];
 
@@ -98,6 +240,12 @@ export const ForecastPage: React.FC = () => {
   useEffect(() => {
     setSelectedFeatures((prev) => prev.filter((f) => modelFeatureOptions.includes(f)));
   }, [model]);
+
+  useEffect(() => {
+    setQaAnswer('');
+    setQaError('');
+    setQaMeta(null);
+  }, [task?.taskId, task?.status]);
 
   const toggleFeature = (feature: string) => {
     setSelectedFeatures((prev) => (
@@ -135,6 +283,40 @@ export const ForecastPage: React.FC = () => {
   const testMetrics = metrics.test_metrics || {};
   const curve = metrics.forecast_curve || [];
   const hasActual = curve.some((p: { y?: number }) => p.y != null && !Number.isNaN(p.y));
+  const qaModel = String(metrics.display_model || metrics.best_model || model || '').trim();
+  const qaOutputDir = String(task?.config?.outputDir || `forecast_agent_output/${province}`);
+
+  const handleAskQa = async () => {
+    const query = qaQuery.trim();
+    if (!query) return;
+    if (!qaModel || qaModel === 'auto' || qaModel === 'auto_select') {
+      setQaError('请先完成预测并确定具体模型，再进行问答。');
+      return;
+    }
+    setQaLoading(true);
+    setQaError('');
+    try {
+      const resp = await askForecastQa({
+        outputDir: qaOutputDir,
+        model: qaModel,
+        query,
+        selectedFeatures,
+      });
+      if (!resp.success || !resp.data) {
+        throw new Error(resp.error || '问答请求失败');
+      }
+      setQaAnswer(resp.data.answer || '');
+      setQaMeta({
+        modelUsed: resp.data.modelUsed || '',
+        rowsUsed: Number(resp.data.rowsUsed || 0),
+        dataMode: resp.data.dataMode || '',
+      });
+    } catch (err: any) {
+      setQaError(String(err?.message || err || '问答失败'));
+    } finally {
+      setQaLoading(false);
+    }
+  };
 
   return (
     <div className="space-y-6 animate-fade-in-up">
@@ -379,6 +561,44 @@ export const ForecastPage: React.FC = () => {
           </CardContent>
         </Card>
       )}
+
+      <Card className="glass">
+        <CardHeader>
+          <CardTitle>LLM 结果问答</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <p className="text-xs text-muted-foreground">
+            基于当前模型结果表（真实值/预测值）和特征列回答问题。
+          </p>
+          <textarea
+            className="w-full min-h-[84px] rounded-lg bg-secondary/50 border border-border px-3 py-2 text-sm"
+            placeholder="例如：为什么 2025-12 到 2026-01 的误差更大？"
+            value={qaQuery}
+            onChange={(e) => setQaQuery(e.target.value)}
+            disabled={qaLoading}
+          />
+          <div className="flex items-center gap-3">
+            <Button onClick={handleAskQa} disabled={qaLoading || !qaQuery.trim()}>
+              {qaLoading ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
+              发送提问
+            </Button>
+            <span className="text-xs text-muted-foreground">
+              结果模型: {qaModel || '-'} | 输出目录: {qaOutputDir}
+            </span>
+          </div>
+          {qaError && <div className="text-sm text-red-400">{qaError}</div>}
+          {qaAnswer && (
+            <div className="rounded-lg border border-border bg-secondary/30 p-3 space-y-2">
+              {qaMeta && (
+                <div className="text-xs text-muted-foreground">
+                  LLM: {qaMeta.modelUsed || '-'} | rows: {qaMeta.rowsUsed} | mode: {qaMeta.dataMode}
+                </div>
+              )}
+              <div>{renderMarkdownLike(qaAnswer)}</div>
+            </div>
+          )}
+        </CardContent>
+      </Card>
 
       <Card className="glass">
         <CardHeader>

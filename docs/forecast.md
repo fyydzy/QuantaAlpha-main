@@ -211,8 +211,22 @@ cd frontend-v2 && bash start.sh
 | 模型 | `auto` 多模型比选，或单选 `lstm`、`xgboost` 等 |
 | 时间 | 旬开始日 `YYYY-MM-DD`（每月 1 / 11 / 21） |
 | context_len | 上下文旬数，默认与 `configs/forecast.yaml` 一致（如 270） |
+| LLM问答 | 基于当前模型的真实/预测表格 + 特征列，按 query 输出解释 |
 
 任务完成后，页面从 `forecast_agent_output/{省份}/` 读取指标与曲线；`auto` 与 CLI 一样可能耗时较长。
+
+#### LLM问答配置（.env）
+
+至少需要：
+
+- `OPENAI_API_KEY`
+- `CHAT_MODEL`（可选，不填走默认模型）
+
+可选：
+
+- `OPENAI_BASE_URL`
+- `FORECAST_QA_ENABLED=true`（开关，默认开启）
+- `FORECAST_QA_MAX_ROWS=120`（送入 LLM 的最大表格行数）
 
 ### 常见问题
 
