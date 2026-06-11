@@ -34,11 +34,11 @@ def forecast(**kwargs):
     return forecast_from_fire(**kwargs)
 
 
-def forecast_search(**kwargs):
-    """LLM 特征组合方案搜索（固定模型对比特征组合）。"""
-    from quantaalpha.forecast_agent.solution_search import forecast_search_from_fire
+def forecast_flow(**kwargs):
+    """燃气预测单轮编排流（M1）：意图解析→重要性→推荐→比选→月度汇总。"""
+    from quantaalpha.forecast_agent.gas_forecast_flow import gas_forecast_flow_from_fire
 
-    return forecast_search_from_fire(**kwargs)
+    return gas_forecast_flow_from_fire(**kwargs)
 
 
 def app():
@@ -47,7 +47,7 @@ def app():
             "mine": mine,
             "backtest": backtest,
             "forecast": forecast,
-            "forecast_search": forecast_search,
+            "forecast_flow": forecast_flow,
             "health_check": health_check,
             "collect_info": collect_info,
         }

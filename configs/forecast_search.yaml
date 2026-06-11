@@ -1,7 +1,11 @@
 # 燃气旬度预测：LLM 特征组合方案搜索（第一版）
 #
-# 使用方式（在项目根目录）：
-#   uv run quantaalpha forecast_search --config configs/forecast_search.yaml
+# 说明：
+# - 本配置为历史实验配置；Web 界面与后端 forecast_search 接口已下线。
+# - 前后端开发启动命令仍保留在 docs/forecast_search.md。
+#
+# 历史运行方式（CLI 入口已移除，仅保留备查）：
+#   uv run python -m quantaalpha.forecast_agent.solution_search --config configs/forecast_search.yaml
 #
 # 注意：LLM API KEY 需写在环境变量或 .env（例如 OPENAI_API_KEY / OPENAI_BASE_URL 等）
 
