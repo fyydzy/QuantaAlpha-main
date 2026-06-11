@@ -267,6 +267,13 @@ export interface ForecastAgentStartParams {
   qaQuery?: string;
 }
 
+export interface ForecastAgentContinueParams {
+  checkpoint?: string;
+  approved?: boolean;
+  overrides?: Record<string, any>;
+  message?: string;
+}
+
 export async function askForecastQa(params: ForecastQaParams) {
   return request<ForecastQaResponse>('/api/v1/forecast/qa', {
     method: 'POST',
@@ -287,6 +294,13 @@ export async function getForecastAgentStatus(taskId: string) {
 
 export async function cancelForecastAgent(taskId: string) {
   return request(`/api/v1/forecast/agent/${taskId}`, { method: 'DELETE' });
+}
+
+export async function continueForecastAgent(taskId: string, params: ForecastAgentContinueParams) {
+  return request<{ task: Task }>(`/api/v1/forecast/agent/${taskId}/continue`, {
+    method: 'POST',
+    body: JSON.stringify(params),
+  });
 }
 
 // ========================== System Config API ==========================

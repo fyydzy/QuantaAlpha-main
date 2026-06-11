@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/Card';
 import { Button } from '@/components/ui/Button';
 import { Badge } from '@/components/ui/Badge';
+import { Progress } from '@/components/ui/Progress';
 import { AlertCircle, Flame, Loader2, Play, Square } from 'lucide-react';
 import { useTaskContext } from '@/context/TaskContext';
 
@@ -64,7 +65,9 @@ export const ForecastPage: React.FC = () => {
     backendAvailable,
     forecastAgentTask,
     forecastAgentLogs,
+    forecastAgentMessages,
     startForecastAgentTask,
+    continueForecastAgentTask,
     stopForecastAgentTask,
   } = useTaskContext();
 
@@ -73,6 +76,8 @@ export const ForecastPage: React.FC = () => {
   const [qaQuery, setQaQuery] = useState('');
   const [contextLen, setContextLen] = useState(270);
   const [starting, setStarting] = useState(false);
+  const [continuing, setContinuing] = useState(false);
+  const [replyText, setReplyText] = useState('');
   const logsEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -81,11 +86,15 @@ export const ForecastPage: React.FC = () => {
 
   const running = forecastAgentTask?.status === 'running';
   const metrics = forecastAgentTask?.metrics || {};
-  const stageMessage = metrics.agent_message as any;
   const compare = (metrics.compare || {}) as any;
   const leaderboard = (compare.leaderboard || []) as any[];
   const monthlyRollup = (compare.monthly_rollup || []) as any[];
   const qa = metrics.qa as any;
+  const taskQuery = String((forecastAgentTask?.config as any)?.query || query || '').trim();
+  const progressValue = Number(forecastAgentTask?.progress?.progress || 0);
+  const progressPhase = String(forecastAgentTask?.progress?.phase || '-');
+  const progressMessage = String(forecastAgentTask?.progress?.message || '');
+  const awaiting = (metrics.awaiting_confirmation || null) as any;
 
   const best = useMemo(() => leaderboard.find((r) => r.rank === 1) || leaderboard[0], [leaderboard]);
 
@@ -106,6 +115,110 @@ export const ForecastPage: React.FC = () => {
     } finally {
       setStarting(false);
     }
+  };
+
+  const handleContinue = async (checkpoint?: string) => {
+    if (!forecastAgentTask || !running) return;
+    setContinuing(true);
+    try {
+      await continueForecastAgentTask({
+        checkpoint,
+        approved: true,
+        message: replyText.trim() || '同意，继续',
+      });
+      setReplyText('');
+    } catch (err) {
+      console.error('Failed to continue forecast agent task:', err);
+    } finally {
+      setContinuing(false);
+    }
+  };
+
+  const renderStagePayload = (stage: string, payload: any) => {
+    if (!payload || typeof payload !== 'object') return null;
+
+    if (stage === 'parse_intent' || stage === 'intent_applied') {
+      return (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-xs">
+          <div>province: <span className="text-foreground/90">{payload.province || '-'}</span></div>
+          <div>target_month: <span className="text-foreground/90">{payload.target_month || '-'}</span></div>
+          <div>test_start: <span className="text-foreground/90">{payload.test_start || '-'}</span></div>
+          <div>test_end: <span className="text-foreground/90">{payload.test_end || '-'}</span></div>
+          <div>as_of_month: <span className="text-foreground/90">{payload.as_of_month || '-'}</span></div>
+        </div>
+      );
+    }
+
+    if (stage === 'diagnose') {
+      const top = Array.isArray(payload.topFeatures) ? payload.topFeatures.slice(0, 8) : [];
+      return (
+        <div className="space-y-2">
+          {top.length > 0 && (
+            <div className="text-xs text-muted-foreground">
+              Top features: {top.map((x: any) => String(x?.name || '-')).join(', ')}
+            </div>
+          )}
+          {payload.testMetrics && (
+            <pre className="text-xs overflow-x-auto bg-black/30 rounded p-2 border border-border">
+              {JSON.stringify(payload.testMetrics, null, 2)}
+            </pre>
+          )}
+        </div>
+      );
+    }
+
+    if (stage === 'recommend' || stage === 'features_applied') {
+      const fs = Array.isArray(payload.featureSuperset) ? payload.featureSuperset : [];
+      return (
+        <div className="space-y-2">
+          <div className="text-xs text-muted-foreground">feature_superset: {fs.join(', ') || '-'}</div>
+          <div className="text-xs text-foreground/90">{payload.reason || ''}</div>
+        </div>
+      );
+    }
+
+    if (stage === 'compare') {
+      const rows = Array.isArray(payload.leaderboard) ? payload.leaderboard.slice(0, 5) : [];
+      return (
+        <div className="space-y-2">
+          <div className="text-xs text-muted-foreground">best_model: {payload.bestModel || '-'}</div>
+          {rows.length > 0 && (
+            <div className="overflow-x-auto">
+              <table className="min-w-full text-xs border border-border rounded">
+                <thead className="bg-secondary/30">
+                  <tr>
+                    <th className="px-2 py-1 text-left">model</th>
+                    <th className="px-2 py-1 text-right">MAPE</th>
+                    <th className="px-2 py-1 text-right">RMSE</th>
+                    <th className="px-2 py-1 text-right">R2</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map((r: any, i: number) => (
+                    <tr key={`cmp-${i}`} className="border-t border-border/40">
+                      <td className="px-2 py-1">{r.model || '-'}</td>
+                      <td className="px-2 py-1 text-right">{r.MAPE ?? '-'}</td>
+                      <td className="px-2 py-1 text-right">{r.RMSE ?? '-'}</td>
+                      <td className="px-2 py-1 text-right">{r.R2 ?? '-'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    if (stage === 'qa' && payload.answer) {
+      return <div>{renderMarkdownLike(String(payload.answer))}</div>;
+    }
+
+    return (
+      <pre className="text-xs overflow-x-auto bg-black/30 rounded p-3 border border-border">
+        {JSON.stringify(payload, null, 2)}
+      </pre>
+    );
   };
 
   return (
@@ -187,18 +300,66 @@ export const ForecastPage: React.FC = () => {
         </CardContent>
       </Card>
 
-      {stageMessage && (
+      {forecastAgentTask && (
         <Card className="glass">
           <CardHeader>
-            <CardTitle>阶段消息</CardTitle>
+            <CardTitle>执行进度</CardTitle>
           </CardHeader>
           <CardContent className="space-y-2">
-            <div className="text-xs text-muted-foreground">stage: {stageMessage.stage}</div>
-            <div className="text-sm font-medium">{stageMessage.text}</div>
-            {stageMessage.payload && (
-              <pre className="text-xs overflow-x-auto bg-black/30 rounded p-3 border border-border">
-                {JSON.stringify(stageMessage.payload, null, 2)}
-              </pre>
+            <div className="text-xs text-muted-foreground">
+              phase: {progressPhase} {progressMessage ? `| ${progressMessage}` : ''}
+            </div>
+            <Progress value={progressValue} showLabel />
+          </CardContent>
+        </Card>
+      )}
+
+      {forecastAgentMessages.length > 0 && (
+        <Card className="glass">
+          <CardHeader>
+            <CardTitle>对话流</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {taskQuery && (
+              <div className="rounded-lg border border-border/70 bg-secondary/30 p-3">
+                <div className="text-xs text-muted-foreground mb-1">用户</div>
+                <div className="text-sm">{taskQuery}</div>
+              </div>
+            )}
+            {forecastAgentMessages.map((msg, i) => (
+              <div key={`${msg.timestamp}-${msg.stage}-${i}`} className="rounded-lg border border-border/70 bg-black/20 p-3 space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="text-xs text-muted-foreground">
+                    {msg.role === 'user' ? '用户' : '助手'} · stage: {msg.stage}
+                  </div>
+                  {msg.needConfirm && <Badge variant="outline">待确认</Badge>}
+                </div>
+                <div className="text-sm font-medium">{msg.text}</div>
+                {renderStagePayload(msg.stage, msg.payload)}
+              </div>
+            ))}
+            {running && awaiting?.checkpoint && (
+              <div className="rounded-lg border border-primary/40 bg-primary/5 p-3 space-y-2">
+                <div className="text-xs text-muted-foreground">
+                  等待确认：{awaiting.checkpoint}
+                </div>
+                <textarea
+                  className="w-full min-h-[72px] rounded-lg bg-secondary/50 border border-border px-3 py-2 text-sm"
+                  placeholder="请输入你的回复，例如：同意继续；或 改成北京、目标月改为2026-05"
+                  value={replyText}
+                  onChange={(e) => setReplyText(e.target.value)}
+                  disabled={continuing}
+                />
+                <div className="flex items-center gap-2">
+                  <Button size="sm" onClick={() => handleContinue(awaiting.checkpoint)} disabled={continuing}>
+                    {continuing ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
+                    发送回复并继续
+                  </Button>
+                  <span className="text-xs text-muted-foreground">
+                    你的回复会由 LLM 解析并覆写参数/特征；仅当 LLM 解析失败时才用规则兜底
+                  </span>
+                </div>
+              </div>
             )}
           </CardContent>
         </Card>

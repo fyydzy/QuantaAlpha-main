@@ -197,6 +197,42 @@ def parse_intent(query: str, *, default_province: str, as_of_month: str | None =
     }
 
 
+def apply_intent_overrides(intent: dict[str, str], overrides: dict[str, Any]) -> dict[str, str]:
+    """Merge confirmation overrides into intent; keep target_month and decadal range aligned."""
+    if not overrides:
+        return intent
+
+    updated = dict(intent)
+    for key, value in overrides.items():
+        if value is not None and str(value).strip():
+            updated[key] = str(value).strip()
+
+    default_province = str(intent.get("province") or "河北")
+    if updated.get("province"):
+        updated["province"] = _normalize_province_name(updated["province"], default_province=default_province)
+
+    test_start_explicit = bool(str(overrides.get("test_start") or "").strip())
+    test_end_explicit = bool(str(overrides.get("test_end") or "").strip())
+    target_month_explicit = bool(str(overrides.get("target_month") or "").strip())
+
+    if test_start_explicit != test_end_explicit:
+        raise ValueError("test_start/test_end 需同时提供，或都不提供由 target_month 自动推导")
+
+    if target_month_explicit and not (test_start_explicit and test_end_explicit):
+        ts, te = _month_to_decadal_range(updated["target_month"])
+        updated["test_start"] = ts
+        updated["test_end"] = te
+    elif test_start_explicit and test_end_explicit:
+        ts = _coerce_decadal_date(updated.get("test_start"))
+        te = _coerce_decadal_date(updated.get("test_end"))
+        if not ts or not te:
+            raise ValueError("test_start/test_end 必须是旬开始日（1/11/21）")
+        updated["test_start"] = ts
+        updated["test_end"] = te
+
+    return updated
+
+
 def _sorted_importance_items(importance: dict[str, Any]) -> list[dict[str, Any]]:
     rows: list[tuple[str, float]] = []
     for k, v in (importance or {}).items():
@@ -295,10 +331,20 @@ def recommend_feature_superset(
     max_feature_count: int,
     top_k: int,
     required_features: list[str] | None = None,
+    intent: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     top_items = importance_items[: max(1, int(top_k))]
     feature_pool_json = feature_pool_for_prompt()
     required = [f for f in (required_features or ["HDD", "Lag_36"]) if f in FEATURE_REGISTRY]
+
+    intent_block = ""
+    if intent:
+        intent_block = f"""
+【当前预测参数（已确认）】
+省份: {intent.get("province")}
+目标月份: {intent.get("target_month")}
+测试区间: {intent.get("test_start")} ~ {intent.get("test_end")}
+"""
 
     system_prompt = (
         "你是燃气销量预测特征选择助手。"
@@ -309,7 +355,7 @@ def recommend_feature_superset(
     user_prompt = f"""请基于以下信息推荐一组特征（单个方案）。\n
 【用户目标】
 {query}
-
+{intent_block}
 【xgboost 特征重要性 Top 列表】
 {json.dumps(top_items, ensure_ascii=False)}
 
@@ -352,6 +398,284 @@ def recommend_feature_superset(
         "reason": reason,
         "source_top_items": top_items,
     }
+
+
+def normalize_continue_overrides(checkpoint: str, overrides: dict[str, Any]) -> dict[str, Any]:
+    """Normalize LLM/rule overrides into flat keys used by the agent flow."""
+    raw = dict(overrides or {})
+    if isinstance(raw.get("intent"), dict):
+        raw = {**raw.get("intent"), **raw}
+
+    if checkpoint == "confirm_intent":
+        out: dict[str, Any] = {}
+        for key, aliases in {
+            "province": ("province",),
+            "target_month": ("target_month", "targetMonth"),
+            "test_start": ("test_start", "testStart"),
+            "test_end": ("test_end", "testEnd"),
+        }.items():
+            for alias in aliases:
+                val = raw.get(alias)
+                if val is not None and str(val).strip():
+                    out[key] = str(val).strip()
+                    break
+        return out
+
+    if checkpoint == "confirm_features":
+        fs = raw.get("featureSuperset")
+        if fs is None:
+            fs = raw.get("feature_superset")
+        if isinstance(fs, str):
+            fs = [x.strip() for x in re.split(r"[,，、;\s]+", fs) if x.strip()]
+        if isinstance(fs, list):
+            cleaned = [str(x).strip() for x in fs if str(x).strip() in FEATURE_REGISTRY]
+            return {"featureSuperset": cleaned} if cleaned else {}
+        return {}
+
+    return raw
+
+
+def _continue_intent_prompt(
+    pending_payload: dict[str, Any],
+    user_message: str,
+) -> tuple[str, str]:
+    intent = pending_payload.get("intent") if isinstance(pending_payload.get("intent"), dict) else pending_payload
+    system_prompt = (
+        "你是天然气预测参数解析助手。"
+        "当前处于参数确认环节：用户已看到系统解析结果，正在用自然语言确认或修改。"
+        "请判断用户是否同意继续，并仅提取用户明确要求修改的字段。"
+        "只输出一个严格 JSON 对象，不要输出任何额外文字。"
+    )
+    user_prompt = f"""【当前已解析参数】
+{json.dumps(intent or {}, ensure_ascii=False, indent=2)}
+
+【用户回复】
+{user_message}
+
+请输出 JSON（全部顶层字段必须出现）：
+{{
+  "approved": true,
+  "overrides": {{
+    "province": "省份中文名（尽量不带'省/市/自治区'后缀）或 null",
+    "target_month": "YYYY-MM 或 null",
+    "test_start": "YYYY-MM-DD 或 null",
+    "test_end": "YYYY-MM-DD 或 null"
+  }}
+}}
+
+要求：
+1) 用户明确拒绝/取消/停止/不同意 -> approved=false；否则 approved=true；
+2) overrides 只填写用户明确要求修改的字段，未提及的字段填 null；
+3) 用户仅说“继续/好的/确认/没问题”等表示同意时，overrides 各字段均为 null；
+4) 若文本只提到“某年某月”，优先填写 target_month；
+5) test_start/test_end 若填写，必须是旬开始日（1/11/21）；未提及则填 null，不要臆造；
+6) 省份尽量输出简称，如“河北”“北京”“内蒙古”“广西”；
+7) 不要编造超出用户回复的信息。
+"""
+    return system_prompt, user_prompt
+
+
+def _continue_features_prompt(
+    pending_payload: dict[str, Any],
+    user_message: str,
+) -> tuple[str, str]:
+    feature_pool_json = feature_pool_for_prompt()
+    current_fs = pending_payload.get("featureSuperset") or pending_payload.get("feature_superset") or []
+    reason = str(pending_payload.get("reason") or "").strip()
+    system_prompt = (
+        "你是燃气销量预测特征选择助手。"
+        "当前处于特征确认环节：用户已看到系统推荐的特征组合，正在用自然语言确认或调整。"
+        "请判断用户是否同意继续，并仅提取用户希望使用的特征组合。"
+        "featureSuperset 只能使用特征池中的名称。"
+        "输出必须是严格 JSON 对象，不要 markdown，不要额外解释。"
+    )
+    user_prompt = f"""【当前推荐特征组合】
+{json.dumps(list(current_fs), ensure_ascii=False)}
+
+【推荐理由】
+{reason or "（无）"}
+
+【可选特征池】（只能从中选择）
+{feature_pool_json}
+
+【用户回复】
+{user_message}
+
+请输出 JSON（全部顶层字段必须出现）：
+{{
+  "approved": true,
+  "overrides": {{
+    "featureSuperset": ["..."] 或 null
+  }}
+}}
+
+硬性约束：
+1) 用户明确拒绝/取消/停止/不同意 -> approved=false；否则 approved=true；
+2) 用户仅说“继续/好的/确认/没问题”等表示同意时，overrides.featureSuperset 为 null；
+3) 用户要求增删改特征时，输出完整的新 featureSuperset 数组（不是增量补丁）；
+4) featureSuperset 只能使用特征池中的 name，禁止编造池外特征；
+5) 若用户只说“去掉某特征”或“加上某特征”，在现有组合基础上调整后输出完整列表；
+6) 不要编造用户未表达的特征偏好。
+"""
+    return system_prompt, user_prompt
+
+
+def _parse_continue_message_with_llm(
+    checkpoint: str,
+    pending_payload: dict[str, Any],
+    user_message: str,
+) -> dict[str, Any]:
+    if checkpoint == "confirm_intent":
+        system_prompt, user_prompt = _continue_intent_prompt(pending_payload, user_message)
+    elif checkpoint == "confirm_features":
+        system_prompt, user_prompt = _continue_features_prompt(pending_payload, user_message)
+    else:
+        system_prompt = (
+            "你是预测任务的确认解析助手。"
+            "请根据用户回复判断是否同意继续，并提取用户希望覆盖的参数。"
+            "只输出严格 JSON 对象。"
+        )
+        user_prompt = f"""当前等待确认点：{checkpoint}
+待确认内容（JSON）：
+{json.dumps(pending_payload or {}, ensure_ascii=False)}
+用户回复：
+{user_message}
+
+请输出：{{"approved": true/false, "overrides": {{}}}}
+"""
+
+    raw = APIBackend().build_messages_and_create_chat_completion(
+        user_prompt=user_prompt,
+        system_prompt=system_prompt,
+        json_mode=True,
+        reasoning_flag=False,
+    )
+    parsed = _extract_json_object(raw)
+    approved = bool(parsed.get("approved", True))
+    raw_overrides = parsed.get("overrides") if isinstance(parsed.get("overrides"), dict) else {}
+
+    if checkpoint == "confirm_intent":
+        intent_ctx = pending_payload.get("intent") if isinstance(pending_payload.get("intent"), dict) else pending_payload
+        default_province = str((intent_ctx or {}).get("province") or "河北")
+        cleaned: dict[str, Any] = {}
+        for key in ("province", "target_month", "test_start", "test_end"):
+            val = raw_overrides.get(key)
+            if val is None or not str(val).strip():
+                continue
+            text = str(val).strip()
+            if key == "province":
+                text = _normalize_province_name(text, default_province=default_province)
+            cleaned[key] = text
+        raw_overrides = cleaned
+    elif checkpoint == "confirm_features":
+        fs = raw_overrides.get("featureSuperset")
+        if fs is None:
+            fs = raw_overrides.get("feature_superset")
+        if fs is not None:
+            if isinstance(fs, str):
+                fs = [x.strip() for x in re.split(r"[,，、;\s]+", fs) if x.strip()]
+            if isinstance(fs, list):
+                picked = [str(x).strip() for x in fs if str(x).strip() in FEATURE_REGISTRY]
+                raw_overrides = {"featureSuperset": picked} if picked else {}
+            else:
+                raw_overrides = {}
+
+    overrides = normalize_continue_overrides(checkpoint, raw_overrides)
+    return {"approved": approved, "overrides": overrides}
+
+
+def _parse_continue_message_rule_based(
+    checkpoint: str,
+    user_message: str,
+    *,
+    default_province: str = "河北",
+) -> dict[str, Any]:
+    text = str(user_message or "").strip()
+    lower = text.lower()
+    approved = not any(k in lower for k in ("取消", "停止", "不同意", "reject", "cancel", "stop"))
+    overrides: dict[str, Any] = {}
+
+    if checkpoint == "confirm_intent":
+        month_match = re.search(r"(20\d{2})\s*[年\-/\.]\s*(\d{1,2})\s*月?", text)
+        if month_match:
+            y = int(month_match.group(1))
+            m = int(month_match.group(2))
+            if 1 <= m <= 12:
+                overrides["target_month"] = f"{y:04d}-{m:02d}"
+
+        date_matches = re.findall(r"(20\d{2}-\d{1,2}-\d{1,2})", text)
+        if len(date_matches) >= 1:
+            overrides["test_start"] = date_matches[0]
+        if len(date_matches) >= 2:
+            overrides["test_end"] = date_matches[1]
+
+        prov_match = re.search(
+            r"(?:省份|地区)?(?:改成|改为|用)?\s*([\u4e00-\u9fa5]{2,9}(?:省|市|自治区|特别行政区)?)",
+            text,
+        )
+        if prov_match:
+            cand = prov_match.group(1).strip()
+            if cand and not any(x in cand for x in ("特征", "模型", "预测", "继续", "确认")):
+                overrides["province"] = _normalize_province_name(cand, default_province=default_province)
+
+    elif checkpoint == "confirm_features":
+        valid_names = list(FEATURE_REGISTRY.keys())
+        picked: list[str] = []
+        for name in valid_names:
+            if name in text and name not in picked:
+                picked.append(name)
+        if picked:
+            overrides["featureSuperset"] = picked
+
+    return {"approved": approved, "overrides": overrides}
+
+
+def parse_continue_message(
+    checkpoint: str,
+    pending_payload: dict[str, Any],
+    user_message: str,
+    *,
+    req_overrides: dict[str, Any] | None = None,
+    req_approved: bool = True,
+) -> dict[str, Any]:
+    """LLM-first continue parsing; rule-based only as fallback."""
+    approved = bool(req_approved)
+    overrides = normalize_continue_overrides(checkpoint, req_overrides or {})
+
+    text = str(user_message or "").strip()
+    if not text:
+        return {"approved": approved, "overrides": overrides}
+
+    intent_ctx = pending_payload.get("intent") if isinstance(pending_payload.get("intent"), dict) else pending_payload
+    default_province = str((intent_ctx or {}).get("province") or "河北")
+
+    try:
+        llm_parsed = _parse_continue_message_with_llm(checkpoint, pending_payload, text)
+        approved = bool(llm_parsed.get("approved", approved))
+        llm_overrides = llm_parsed.get("overrides")
+        if isinstance(llm_overrides, dict) and llm_overrides:
+            overrides = {**overrides, **llm_overrides}
+    except Exception as exc:
+        logger.warning(f"parse_continue_message LLM 解析失败，回退规则: {exc}")
+        rule_parsed = _parse_continue_message_rule_based(
+            checkpoint, text, default_province=default_province
+        )
+        approved = bool(rule_parsed.get("approved", approved))
+        rule_overrides = rule_parsed.get("overrides")
+        if isinstance(rule_overrides, dict) and rule_overrides:
+            overrides = {**overrides, **normalize_continue_overrides(checkpoint, rule_overrides)}
+        return {"approved": approved, "overrides": overrides}
+
+    rule_parsed = _parse_continue_message_rule_based(checkpoint, text, default_province=default_province)
+    rule_overrides = normalize_continue_overrides(
+        checkpoint,
+        rule_parsed.get("overrides") if isinstance(rule_parsed.get("overrides"), dict) else {},
+    )
+    for key, value in rule_overrides.items():
+        if key not in overrides or overrides.get(key) in (None, "", []):
+            overrides[key] = value
+
+    return {"approved": approved, "overrides": overrides}
 
 
 def _load_model_feature_cols_used(out_root: Path, model: str) -> list[str]:
@@ -623,8 +947,11 @@ __all__ = [
     "FIXED_AS_OF_DATE",
     "GasForecastFlowConfig",
     "parse_intent",
+    "apply_intent_overrides",
     "diagnose_importance",
     "recommend_feature_superset",
+    "normalize_continue_overrides",
+    "parse_continue_message",
     "_normalize_candidate_models",
     "ask_flow_qa",
     "run_compare_and_rollup",

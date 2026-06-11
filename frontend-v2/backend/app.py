@@ -10,6 +10,7 @@ import asyncio
 import glob
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -94,6 +95,14 @@ class ForecastAgentStartRequest(BaseModel):
     qaQuery: Optional[str] = Field(None, description="Optional QA query after forecast")
 
 
+class ForecastAgentContinueRequest(BaseModel):
+    """Request to continue a paused forecast agent checkpoint."""
+    checkpoint: Optional[str] = Field(None, description="Expected waiting checkpoint")
+    approved: bool = Field(True, description="Whether user approves to continue")
+    overrides: Optional[Dict[str, Any]] = Field(None, description="Optional override payload")
+    message: Optional[str] = Field(None, description="Optional user message")
+
+
 class SystemConfigUpdate(BaseModel):
     """Partial update to system configuration (.env)."""
     QLIB_DATA_DIR: Optional[str] = None
@@ -115,6 +124,9 @@ class ApiResponse(BaseModel):
 
 tasks: Dict[str, Dict[str, Any]] = {}
 ws_connections: Dict[str, List[WebSocket]] = {}  # task_id -> list of WS
+# Forecast agent pause/resume handles (must not live on task dict — breaks JSON API)
+_forecast_continue_events: Dict[str, asyncio.Event] = {}
+_forecast_continue_payloads: Dict[str, Dict[str, Any]] = {}
 
 
 # ========================== Utility Helpers ==========================
@@ -125,6 +137,11 @@ def _gen_id() -> str:
 
 def _now() -> str:
     return datetime.now().isoformat()
+
+
+def _task_for_api(task: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a JSON-serializable copy of task state (strip runtime-only fields)."""
+    return {k: v for k, v in task.items() if not str(k).startswith("_")}
 
 def _decode_subprocess_line(line_bytes: bytes) -> str:
     """Best-effort decode for Windows consoles and UTF-8 Python output."""
@@ -1397,8 +1414,10 @@ async def _run_forecast_agent(
 
         from quantaalpha.forecast_agent.gas_forecast_flow import (
             FIXED_AS_OF_DATE,
+            apply_intent_overrides,
             ask_flow_qa,
             diagnose_importance,
+            normalize_continue_overrides,
             parse_intent,
             recommend_feature_superset,
             run_compare_and_rollup,
@@ -1421,6 +1440,23 @@ async def _run_forecast_agent(
             return dict(task["progress"])
 
         async def _emit_stage(stage: str, text: str, payload: Dict[str, Any], *, need_confirm: bool = False):
+            agent_message = {
+                "role": "assistant",
+                "stage": stage,
+                "messageType": f"{stage}_card",
+                "text": text,
+                "payload": payload,
+                "needConfirm": need_confirm,
+                "timestamp": _now(),
+            }
+            if not isinstance(task.get("metrics"), dict):
+                task["metrics"] = {}
+            msg_list = task["metrics"].get("agent_messages")
+            if not isinstance(msg_list, list):
+                msg_list = []
+            msg_list.append(agent_message)
+            task["metrics"]["agent_messages"] = msg_list[-200:]
+            task["metrics"]["agent_message"] = agent_message
             await _broadcast(
                 task_id,
                 {
@@ -1428,19 +1464,54 @@ async def _run_forecast_agent(
                     "taskId": task_id,
                     "data": {
                         "agent_stage": stage,
-                        "agent_message": {
-                            "role": "assistant",
-                            "stage": stage,
-                            "messageType": f"{stage}_card",
-                            "text": text,
-                            "payload": payload,
-                            "needConfirm": need_confirm,
-                            "timestamp": _now(),
-                        },
+                        "agent_message": agent_message,
                     },
                     "timestamp": _now(),
                 },
             )
+
+        async def _wait_for_continue(checkpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+            event = asyncio.Event()
+            _forecast_continue_events[task_id] = event
+            _forecast_continue_payloads.pop(task_id, None)
+            if not isinstance(task.get("metrics"), dict):
+                task["metrics"] = {}
+            task["metrics"]["awaiting_confirmation"] = {
+                "checkpoint": checkpoint,
+                "timestamp": _now(),
+                "payload": payload,
+            }
+            await _broadcast(
+                task_id,
+                {
+                    "type": "metrics",
+                    "taskId": task_id,
+                    "data": {
+                        "awaiting_confirmation": task["metrics"]["awaiting_confirmation"],
+                    },
+                    "timestamp": _now(),
+                },
+            )
+            await _emit_stage(
+                checkpoint,
+                "请确认后继续执行。",
+                payload,
+                need_confirm=True,
+            )
+            await event.wait()
+            cont = _forecast_continue_payloads.pop(task_id, None)
+            _forecast_continue_events.pop(task_id, None)
+            task["metrics"]["awaiting_confirmation"] = None
+            await _broadcast(
+                task_id,
+                {
+                    "type": "metrics",
+                    "taskId": task_id,
+                    "data": {"awaiting_confirmation": None},
+                    "timestamp": _now(),
+                },
+            )
+            return cont if isinstance(cont, dict) else {}
 
         await _broadcast(task_id, {"type": "progress", "taskId": task_id, "data": _set_progress("parsing", 10, "解析用户意图..."), "timestamp": _now()})
         intent = await asyncio.to_thread(
@@ -1450,6 +1521,16 @@ async def _run_forecast_agent(
             as_of_month=FIXED_AS_OF_DATE,
         )
         await _emit_stage("parse_intent", "已解析预测参数。", intent)
+        cont_intent = await _wait_for_continue("confirm_intent", {"intent": intent})
+        if cont_intent.get("approved") is False:
+            raise RuntimeError("用户在参数确认阶段取消了任务")
+        intent_overrides = normalize_continue_overrides(
+            "confirm_intent",
+            cont_intent.get("overrides") if isinstance(cont_intent.get("overrides"), dict) else {},
+        )
+        if intent_overrides:
+            intent = apply_intent_overrides(intent, intent_overrides)
+            await _emit_stage("intent_applied", "已根据你的回复更新预测参数。", intent)
 
         await _broadcast(task_id, {"type": "progress", "taskId": task_id, "data": _set_progress("analyzing", 30, "运行 xgboost 诊断并提取重要性..."), "timestamp": _now()})
         diagnose = await asyncio.to_thread(
@@ -1471,6 +1552,7 @@ async def _run_forecast_agent(
         recommend = await asyncio.to_thread(
             recommend_feature_superset,
             query=req.query,
+            intent=intent,
             importance_items=diagnose.get("importance_items", []),
             max_feature_count=int(req.maxFeatureCount or 10),
             top_k=int(req.importanceTopK or 12),
@@ -1484,6 +1566,30 @@ async def _run_forecast_agent(
                 "reason": recommend.get("reason", ""),
             },
         )
+        cont_features = await _wait_for_continue(
+            "confirm_features",
+            {
+                "featureSuperset": recommend.get("feature_superset", []),
+                "reason": recommend.get("reason", ""),
+            },
+        )
+        if cont_features.get("approved") is False:
+            raise RuntimeError("用户在特征确认阶段取消了任务")
+        feature_overrides = normalize_continue_overrides(
+            "confirm_features",
+            cont_features.get("overrides") if isinstance(cont_features.get("overrides"), dict) else {},
+        )
+        fs = feature_overrides.get("featureSuperset")
+        if isinstance(fs, list) and fs:
+            recommend["feature_superset"] = fs
+            await _emit_stage(
+                "features_applied",
+                "已根据你的回复更新特征组合。",
+                {
+                    "featureSuperset": recommend["feature_superset"],
+                    "reason": recommend.get("reason", ""),
+                },
+            )
 
         await _broadcast(task_id, {"type": "progress", "taskId": task_id, "data": _set_progress("forecasting", 75, "执行多模型比选与预测..."), "timestamp": _now()})
         compare = await asyncio.to_thread(
@@ -1503,6 +1609,7 @@ async def _run_forecast_agent(
                 "monthlyRollup": compare.get("monthly_rollup", []),
             },
         )
+        selected_model = str(compare.get("best_model") or "")
 
         payload: Dict[str, Any] = {
             "query": req.query,
@@ -1517,15 +1624,16 @@ async def _run_forecast_agent(
                 "reason": recommend.get("reason", ""),
             },
             "compare": compare,
+            "selected_model": selected_model,
             "output_dir": str(out_root),
         }
 
-        if req.qaQuery and str(req.qaQuery).strip() and compare.get("best_model"):
+        if req.qaQuery and str(req.qaQuery).strip() and selected_model:
             await _broadcast(task_id, {"type": "progress", "taskId": task_id, "data": _set_progress("qa", 90, "生成问答结果..."), "timestamp": _now()})
             qa = await asyncio.to_thread(
                 ask_flow_qa,
                 output_dir=out_root,
-                model=str(compare.get("best_model")),
+                model=selected_model,
                 query=str(req.qaQuery),
                 selected_features=list(recommend.get("feature_superset") or []),
             )
@@ -1594,7 +1702,7 @@ async def start_forecast_agent(req: ForecastAgentStartRequest):
     asyncio.create_task(_run_forecast_agent(task_id, req, output_dir))
     return ApiResponse(
         success=True,
-        data={"taskId": task_id, "task": task},
+        data={"taskId": task_id, "task": _task_for_api(task)},
         message="预测智能体已启动",
     )
 
@@ -1603,7 +1711,7 @@ async def start_forecast_agent(req: ForecastAgentStartRequest):
 async def get_forecast_agent_status(task_id: str):
     if task_id not in tasks:
         raise HTTPException(status_code=404, detail="Task not found")
-    return ApiResponse(success=True, data={"task": tasks[task_id]})
+    return ApiResponse(success=True, data={"task": _task_for_api(tasks[task_id])})
 
 
 @app.delete("/api/v1/forecast/agent/{task_id}", response_model=ApiResponse)
@@ -1613,6 +1721,10 @@ async def cancel_forecast_agent(task_id: str):
     task = tasks[task_id]
     task["status"] = "cancelled"
     task["updatedAt"] = _now()
+    _forecast_continue_payloads.pop(task_id, None)
+    cont_event = _forecast_continue_events.pop(task_id, None)
+    if isinstance(cont_event, asyncio.Event):
+        cont_event.set()
     await _broadcast(task_id, {
         "type": "result",
         "taskId": task_id,
@@ -1620,6 +1732,88 @@ async def cancel_forecast_agent(task_id: str):
         "timestamp": _now(),
     })
     return ApiResponse(success=True, message="预测智能体任务已取消")
+
+
+@app.post("/api/v1/forecast/agent/{task_id}/continue", response_model=ApiResponse)
+async def continue_forecast_agent(task_id: str, req: ForecastAgentContinueRequest):
+    if task_id not in tasks:
+        raise HTTPException(status_code=404, detail="Task not found")
+    task = tasks[task_id]
+    awaiting = ((task.get("metrics") or {}).get("awaiting_confirmation") or {})
+    if not awaiting:
+        raise HTTPException(status_code=409, detail="当前任务不在等待确认状态")
+    if req.checkpoint and req.checkpoint != awaiting.get("checkpoint"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"checkpoint 不匹配，当前等待: {awaiting.get('checkpoint')}",
+        )
+    user_message = str(req.message or "").strip()
+    checkpoint = str(awaiting.get("checkpoint") or "")
+    from quantaalpha.forecast_agent.gas_forecast_flow import parse_continue_message
+
+    parsed_continue = parse_continue_message(
+        checkpoint,
+        awaiting.get("payload") or {},
+        user_message,
+        req_overrides=req.overrides,
+        req_approved=bool(req.approved),
+    )
+    approved = bool(parsed_continue.get("approved", True))
+    overrides = parsed_continue.get("overrides") if isinstance(parsed_continue.get("overrides"), dict) else {}
+
+    _forecast_continue_payloads[task_id] = {
+        "approved": approved,
+        "overrides": overrides,
+        "message": user_message,
+    }
+    event = _forecast_continue_events.get(task_id)
+    if isinstance(event, asyncio.Event):
+        event.set()
+
+    if user_message:
+        if not isinstance(task.get("metrics"), dict):
+            task["metrics"] = {}
+        msg_list = task["metrics"].get("agent_messages")
+        if not isinstance(msg_list, list):
+            msg_list = []
+        user_msg = {
+            "role": "user",
+            "stage": awaiting.get("checkpoint") or "",
+            "messageType": "user_reply",
+            "text": user_message,
+            "payload": {"approved": approved, "overrides": overrides},
+            "needConfirm": False,
+            "timestamp": _now(),
+        }
+        msg_list.append(user_msg)
+        task["metrics"]["agent_messages"] = msg_list[-200:]
+        task["metrics"]["agent_message"] = user_msg
+        await _broadcast(
+            task_id,
+            {
+                "type": "metrics",
+                "taskId": task_id,
+                "data": {"agent_message": user_msg},
+                "timestamp": _now(),
+            },
+        )
+
+    log_entry = {
+        "id": _gen_id(),
+        "timestamp": _now(),
+        "level": "info",
+        "message": f"收到继续确认: checkpoint={awaiting.get('checkpoint')} approved={approved} overrides={json.dumps(overrides, ensure_ascii=False)}",
+    }
+    task["logs"].append(log_entry)
+    if len(task["logs"]) > 2000:
+        task["logs"] = task["logs"][-2000:]
+    await _broadcast(task_id, {
+        "type": "log",
+        "taskId": task_id,
+        "data": log_entry,
+        "timestamp": _now(),
+    })
+    return ApiResponse(success=True, data={"task": _task_for_api(task)}, message="已提交继续指令")
 
 
 def _load_forecast_test_points_for_ui(model_dir: Path, model_name: str) -> list[dict[str, Any]]:

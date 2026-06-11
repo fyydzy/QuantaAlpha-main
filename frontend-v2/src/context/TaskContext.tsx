@@ -25,11 +25,13 @@ import {
   startForecastAgent as apiStartForecastAgent,
   getForecastAgentStatus,
   cancelForecastAgent as apiCancelForecastAgent,
+  continueForecastAgent as apiContinueForecastAgent,
   connectMiningWs,
   healthCheck,
 } from '@/services/api';
 import type {
   BacktestStartParams,
+  ForecastAgentContinueParams,
   ForecastAgentStartParams,
 } from '@/services/api';
 import { getDefaultMiningDirection } from '@/utils/miningDirections';
@@ -50,6 +52,16 @@ export interface BacktestTask {
   config: Record<string, any>;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface ForecastAgentMessage {
+  role: string;
+  stage: string;
+  messageType: string;
+  text: string;
+  payload?: Record<string, any>;
+  needConfirm?: boolean;
+  timestamp: string;
 }
 
 // ========================== Context Value ==========================
@@ -76,7 +88,9 @@ interface TaskContextValue {
   // ---- Forecast Agent ----
   forecastAgentTask: BacktestTask | null;
   forecastAgentLogs: LogEntry[];
+  forecastAgentMessages: ForecastAgentMessage[];
   startForecastAgentTask: (params: ForecastAgentStartParams) => Promise<void>;
+  continueForecastAgentTask: (params: ForecastAgentContinueParams) => Promise<void>;
   stopForecastAgentTask: () => void;
 }
 
@@ -591,6 +605,7 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
   // ==================================================================
   const [forecastAgentTask, setForecastAgentTask] = useState<BacktestTask | null>(null);
   const [forecastAgentLogs, setForecastAgentLogs] = useState<LogEntry[]>([]);
+  const [forecastAgentMessages, setForecastAgentMessages] = useState<ForecastAgentMessage[]>([]);
   const forecastAgentWsRef = useRef<WebSocket | null>(null);
   const forecastAgentPollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -606,6 +621,21 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setForecastAgentLogs((l) => [...l.slice(-499), msg.data as LogEntry]);
         break;
       case 'metrics':
+        if (msg.data && typeof msg.data === 'object' && (msg.data as any).agent_message) {
+          const nextMsg = (msg.data as any).agent_message as ForecastAgentMessage;
+          setForecastAgentMessages((prev) => {
+            const last = prev[prev.length - 1];
+            if (
+              last &&
+              last.timestamp === nextMsg.timestamp &&
+              last.stage === nextMsg.stage &&
+              last.text === nextMsg.text
+            ) {
+              return prev;
+            }
+            return [...prev, nextMsg];
+          });
+        }
         setForecastAgentTask((prev) => {
           if (!prev) return prev;
           const nextMetrics = {
@@ -647,11 +677,17 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const startForecastAgentTask = useCallback(
     async (params: ForecastAgentStartParams) => {
       setForecastAgentLogs([]);
+      setForecastAgentMessages([]);
       const resp = await apiStartForecastAgent(params);
       if (!resp.success || !resp.data) throw new Error(resp.error || 'Failed');
 
       const taskData = resp.data.task as unknown as BacktestTask;
       setForecastAgentTask(taskData);
+      const initialMessages =
+        ((taskData.metrics as any)?.agent_messages as ForecastAgentMessage[] | undefined) || [];
+      if (initialMessages.length > 0) {
+        setForecastAgentMessages(initialMessages);
+      }
 
       const ws = connectMiningWs(
         resp.data.taskId,
@@ -682,6 +718,11 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
             if (t.status === 'completed' || t.status === 'failed' || t.status === 'cancelled') {
               setForecastAgentTask(t);
               if (t.logs?.length) setForecastAgentLogs(t.logs.slice(-500));
+              const finalMessages =
+                ((t.metrics as any)?.agent_messages as ForecastAgentMessage[] | undefined) || [];
+              if (finalMessages.length > 0) {
+                setForecastAgentMessages(finalMessages);
+              }
               clearInterval(forecastAgentPollingRef.current!);
               forecastAgentPollingRef.current = null;
             }
@@ -710,6 +751,15 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setForecastAgentTask((prev) => (prev ? { ...prev, status: 'cancelled' } : prev));
   }, [forecastAgentTask]);
 
+  const continueForecastAgentTask = useCallback(
+    async (params: ForecastAgentContinueParams) => {
+      if (!forecastAgentTask) return;
+      const resp = await apiContinueForecastAgent(forecastAgentTask.taskId, params);
+      if (!resp.success) throw new Error(resp.error || 'Failed to continue');
+    },
+    [forecastAgentTask],
+  );
+
   // ==================================================================
   // Context value
   // ==================================================================
@@ -732,7 +782,9 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
     forecastAgentTask,
     forecastAgentLogs,
+    forecastAgentMessages,
     startForecastAgentTask,
+    continueForecastAgentTask,
     stopForecastAgentTask,
   };
 
