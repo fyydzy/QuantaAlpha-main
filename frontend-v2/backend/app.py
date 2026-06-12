@@ -1492,9 +1492,14 @@ async def _run_forecast_agent(
                     "timestamp": _now(),
                 },
             )
+            confirm_text = (
+                "以上是我理解的预测参数。若无问题请直接回复「继续」；也可说明要改的省份或目标月份。"
+                if checkpoint == "confirm_intent"
+                else "以上是我推荐的特征组合。若同意请回复「继续」；也可直接说想增删哪些特征。"
+            )
             await _emit_stage(
                 checkpoint,
-                "请确认后继续执行。",
+                confirm_text,
                 payload,
                 need_confirm=True,
             )
@@ -1520,7 +1525,7 @@ async def _run_forecast_agent(
             default_province=str(req.province or "河北"),
             as_of_month=FIXED_AS_OF_DATE,
         )
-        await _emit_stage("parse_intent", "已解析预测参数。", intent)
+        await _emit_stage("parse_intent", "我已根据你的描述解析出以下预测参数：", intent)
         cont_intent = await _wait_for_continue("confirm_intent", {"intent": intent})
         if cont_intent.get("approved") is False:
             raise RuntimeError("用户在参数确认阶段取消了任务")
@@ -1530,7 +1535,7 @@ async def _run_forecast_agent(
         )
         if intent_overrides:
             intent = apply_intent_overrides(intent, intent_overrides)
-            await _emit_stage("intent_applied", "已根据你的回复更新预测参数。", intent)
+            await _emit_stage("intent_applied", "好的，我已按你的要求更新了预测参数：", intent)
 
         await _broadcast(task_id, {"type": "progress", "taskId": task_id, "data": _set_progress("analyzing", 30, "运行 xgboost 诊断并提取重要性..."), "timestamp": _now()})
         diagnose = await asyncio.to_thread(
@@ -1541,7 +1546,7 @@ async def _run_forecast_agent(
         )
         await _emit_stage(
             "diagnose",
-            "已完成重要性诊断。",
+            "我已完成 xgboost 特征重要性诊断，以下是 Top 特征：",
             {
                 "topFeatures": diagnose.get("importance_items", [])[: int(req.importanceTopK or 12)],
                 "testMetrics": diagnose.get("test_metrics", {}),
@@ -1560,7 +1565,7 @@ async def _run_forecast_agent(
         )
         await _emit_stage(
             "recommend",
-            "已生成候选特征组合。",
+            "结合重要性证据，我为你推荐了以下特征组合：",
             {
                 "featureSuperset": recommend.get("feature_superset", []),
                 "reason": recommend.get("reason", ""),
@@ -1584,7 +1589,7 @@ async def _run_forecast_agent(
             recommend["feature_superset"] = fs
             await _emit_stage(
                 "features_applied",
-                "已根据你的回复更新特征组合。",
+                "好的，我已按你的要求更新了特征组合：",
                 {
                     "featureSuperset": recommend["feature_superset"],
                     "reason": recommend.get("reason", ""),
@@ -1602,7 +1607,7 @@ async def _run_forecast_agent(
         )
         await _emit_stage(
             "compare",
-            "模型比选完成。",
+            "多模型比选已完成，结果如下：",
             {
                 "bestModel": compare.get("best_model"),
                 "leaderboard": compare.get("leaderboard", []),
@@ -1751,13 +1756,16 @@ async def continue_forecast_agent(task_id: str, req: ForecastAgentContinueReques
     checkpoint = str(awaiting.get("checkpoint") or "")
     from quantaalpha.forecast_agent.gas_forecast_flow import parse_continue_message
 
-    parsed_continue = parse_continue_message(
-        checkpoint,
-        awaiting.get("payload") or {},
-        user_message,
-        req_overrides=req.overrides,
-        req_approved=bool(req.approved),
-    )
+    try:
+        parsed_continue = parse_continue_message(
+            checkpoint,
+            awaiting.get("payload") or {},
+            user_message,
+            req_overrides=req.overrides,
+            req_approved=bool(req.approved),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     approved = bool(parsed_continue.get("approved", True))
     overrides = parsed_continue.get("overrides") if isinstance(parsed_continue.get("overrides"), dict) else {}
 

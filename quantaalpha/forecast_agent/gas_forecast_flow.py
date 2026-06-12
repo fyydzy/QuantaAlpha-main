@@ -64,15 +64,6 @@ def _extract_json_object(text: str) -> dict[str, Any]:
     return payload
 
 
-def _parse_target_month(query: str) -> str | None:
-    text = str(query or "").strip()
-    # 2026年3月 / 2026-03 / 2026/03
-    m = re.search(r"(20\d{2})\s*[年/\-\.]\s*(1[0-2]|0?[1-9])\s*月?", text)
-    if m:
-        return f"{int(m.group(1)):04d}-{int(m.group(2)):02d}"
-    return None
-
-
 def _month_to_decadal_range(month_yyyy_mm: str) -> tuple[str, str]:
     y, m = month_yyyy_mm.split("-")
     return (f"{int(y):04d}-{int(m):02d}-01", f"{int(y):04d}-{int(m):02d}-21")
@@ -122,11 +113,36 @@ def _parse_intent_with_llm(query: str, *, default_province: str) -> dict[str, An
 }}
 
 要求：
-1) 若文本只提到“某年某月”，优先填写 target_month；
-2) test_start/test_end 若填写，必须是旬开始日（1/11/21）；
-3) 若原文未提及具体日期，可填 null，不要臆造；
-4) 省份字段尽量输出简称，如“河北”“北京”“内蒙古”“广西”；
-5) 不要编造超出原文的信息。
+1) 若文本只提到“某年某月”，优先填写 target_month，test_start/test_end 填 null；
+2) 若文本提到跨月区间（如“3月到4月”“2026年3月至4月”），必须同时填写 test_start 和 test_end；
+   target_month 填区间结束月（如 2026-04）；
+3) test_start/test_end 若填写，必须是旬开始日（1/11/21）；
+4) 若原文未提及具体日期，必须填 null，不要臆造；
+5) province 只有在用户明确提及省份时才可填写；未提及必须填 null；
+6) province 只能是行政区名称，不得输出无关词汇；
+7) 省份字段一定要输出简称，如“河北”“北京”“内蒙古”“广西”；
+8) 不要编造超出原文的信息；
+9) 输出前自检：四个字段都必须存在；未提及字段必须为 null。
+
+示例1（单月）：
+输入：预测2026年3月河北天然气销量
+输出：
+{{
+  "province": "河北",
+  "target_month": "2026-03",
+  "test_start": null,
+  "test_end": null
+}}
+
+示例2（跨月）：
+输入：预测2026年3月到4月河北天然气销量
+输出：
+{{
+  "province": "河北",
+  "target_month": "2026-04",
+  "test_start": "2026-03-01",
+  "test_end": "2026-04-21"
+}}
 """
     raw = APIBackend().build_messages_and_create_chat_completion(
         user_prompt=user_prompt,
@@ -148,9 +164,8 @@ def parse_intent(query: str, *, default_province: str, as_of_month: str | None =
 
     Rules:
     1) target_month:
-       - Prefer LLM parsed value.
-       - Else try regex extraction from query.
-       - If still missing -> raise (no silent default month).
+       - Must come from LLM parsed value.
+       - Missing value -> raise (no rule extraction fallback).
     2) test_start/test_end:
        - If both are provided and valid decadal dates, use them.
        - If both are missing, derive from target_month: YYYY-MM-01 ~ YYYY-MM-21.
@@ -158,21 +173,15 @@ def parse_intent(query: str, *, default_province: str, as_of_month: str | None =
     3) as_of_month:
        - Fixed to the configured as_of date (no LLM parse, no rule fallback).
     """
-    llm_obj: dict[str, Any] | None = None
-    llm_err: Exception | None = None
     try:
         llm_obj = _parse_intent_with_llm(query, default_province=default_province)
     except Exception as exc:  # noqa: BLE001
-        llm_err = exc
-        logger.warning(f"parse_intent LLM 解析失败，尝试规则解析: {exc}")
+        logger.warning(f"parse_intent LLM 解析失败（无规则兜底）: {exc}")
+        raise ValueError("无法解析目标月份：LLM 解析失败，请重试并明确说明月份。") from exc
 
-    target_month = (llm_obj or {}).get("target_month") or _parse_target_month(query)
+    target_month = (llm_obj or {}).get("target_month")
     if not target_month:
-        if llm_err is not None:
-            raise ValueError(
-                "无法解析目标月份：LLM 解析失败且 query 未提供明确月份，请在 query 中写明 YYYY年M月"
-            ) from llm_err
-        raise ValueError("无法从 query 解析目标月份，请明确说明如“预测 2026年3月 河北天然气销量”")
+        raise ValueError("无法解析目标月份：请在需求中明确说明如“预测 2026年3月 河北天然气销量”")
     test_start = (llm_obj or {}).get("test_start")
     test_end = (llm_obj or {}).get("test_end")
     if test_start and test_end:
@@ -467,10 +476,47 @@ def _continue_intent_prompt(
 1) 用户明确拒绝/取消/停止/不同意 -> approved=false；否则 approved=true；
 2) overrides 只填写用户明确要求修改的字段，未提及的字段填 null；
 3) 用户仅说“继续/好的/确认/没问题”等表示同意时，overrides 各字段均为 null；
-4) 若文本只提到“某年某月”，优先填写 target_month；
-5) test_start/test_end 若填写，必须是旬开始日（1/11/21）；未提及则填 null，不要臆造；
-6) 省份尽量输出简称，如“河北”“北京”“内蒙古”“广西”；
-7) 不要编造超出用户回复的信息。
+4) 若用户只改“某年某月”，只填 target_month，test_start/test_end 填 null；
+5) 若用户要求跨月区间（如“改成3月到4月”），必须同时填 test_start 和 test_end，
+   target_month 填区间结束月；未改动的字段填 null；
+6) test_start/test_end 若填写，必须是旬开始日（1/11/21）；未提及则填 null，不要臆造；
+7) 省份尽量输出简称，如“河北”“北京”“内蒙古”“广西”；
+8) province 只有在用户明确提出“改省份/换地区”时才可填写，否则必须为 null；
+9) province 只能是行政区名称，不得输出无关词汇；
+10) 不要编造超出用户回复的信息；
+11) 输出前自检：approved 必须是布尔；overrides 四个字段必须都出现，未提及字段必须为 null。
+
+示例1（改单月）：
+【当前已解析参数】
+{{"province": "河北", "target_month": "2026-03", "test_start": "2026-03-01", "test_end": "2026-03-21"}}
+【用户回复】
+改成2025年12月
+输出：
+{{
+  "approved": true,
+  "overrides": {{
+    "province": null,
+    "target_month": "2025-12",
+    "test_start": null,
+    "test_end": null
+  }}
+}}
+
+示例2（改跨月）：
+【当前已解析参数】
+{{"province": "河北", "target_month": "2026-03", "test_start": "2026-03-01", "test_end": "2026-03-21"}}
+【用户回复】
+改成预测2026年3月到4月
+输出：
+{{
+  "approved": true,
+  "overrides": {{
+    "province": null,
+    "target_month": "2026-04",
+    "test_start": "2026-03-01",
+    "test_end": "2026-04-21"
+  }}
+}}
 """
     return system_prompt, user_prompt
 
@@ -515,7 +561,9 @@ def _continue_features_prompt(
 3) 用户要求增删改特征时，输出完整的新 featureSuperset 数组（不是增量补丁）；
 4) featureSuperset 只能使用特征池中的 name，禁止编造池外特征；
 5) 若用户只说“去掉某特征”或“加上某特征”，在现有组合基础上调整后输出完整列表；
-6) 不要编造用户未表达的特征偏好。
+6) 用户未明确要求调整特征时，必须输出 null，不要猜测；
+7) 不要编造用户未表达的特征偏好；
+8) 输出前自检：approved 必须是布尔；overrides 中必须有且仅有 featureSuperset 字段。
 """
     return system_prompt, user_prompt
 
@@ -555,17 +603,12 @@ def _parse_continue_message_with_llm(
     raw_overrides = parsed.get("overrides") if isinstance(parsed.get("overrides"), dict) else {}
 
     if checkpoint == "confirm_intent":
-        intent_ctx = pending_payload.get("intent") if isinstance(pending_payload.get("intent"), dict) else pending_payload
-        default_province = str((intent_ctx or {}).get("province") or "河北")
         cleaned: dict[str, Any] = {}
         for key in ("province", "target_month", "test_start", "test_end"):
             val = raw_overrides.get(key)
             if val is None or not str(val).strip():
                 continue
-            text = str(val).strip()
-            if key == "province":
-                text = _normalize_province_name(text, default_province=default_province)
-            cleaned[key] = text
+            cleaned[key] = str(val).strip()
         raw_overrides = cleaned
     elif checkpoint == "confirm_features":
         fs = raw_overrides.get("featureSuperset")
@@ -584,52 +627,6 @@ def _parse_continue_message_with_llm(
     return {"approved": approved, "overrides": overrides}
 
 
-def _parse_continue_message_rule_based(
-    checkpoint: str,
-    user_message: str,
-    *,
-    default_province: str = "河北",
-) -> dict[str, Any]:
-    text = str(user_message or "").strip()
-    lower = text.lower()
-    approved = not any(k in lower for k in ("取消", "停止", "不同意", "reject", "cancel", "stop"))
-    overrides: dict[str, Any] = {}
-
-    if checkpoint == "confirm_intent":
-        month_match = re.search(r"(20\d{2})\s*[年\-/\.]\s*(\d{1,2})\s*月?", text)
-        if month_match:
-            y = int(month_match.group(1))
-            m = int(month_match.group(2))
-            if 1 <= m <= 12:
-                overrides["target_month"] = f"{y:04d}-{m:02d}"
-
-        date_matches = re.findall(r"(20\d{2}-\d{1,2}-\d{1,2})", text)
-        if len(date_matches) >= 1:
-            overrides["test_start"] = date_matches[0]
-        if len(date_matches) >= 2:
-            overrides["test_end"] = date_matches[1]
-
-        prov_match = re.search(
-            r"(?:省份|地区)?(?:改成|改为|用)?\s*([\u4e00-\u9fa5]{2,9}(?:省|市|自治区|特别行政区)?)",
-            text,
-        )
-        if prov_match:
-            cand = prov_match.group(1).strip()
-            if cand and not any(x in cand for x in ("特征", "模型", "预测", "继续", "确认")):
-                overrides["province"] = _normalize_province_name(cand, default_province=default_province)
-
-    elif checkpoint == "confirm_features":
-        valid_names = list(FEATURE_REGISTRY.keys())
-        picked: list[str] = []
-        for name in valid_names:
-            if name in text and name not in picked:
-                picked.append(name)
-        if picked:
-            overrides["featureSuperset"] = picked
-
-    return {"approved": approved, "overrides": overrides}
-
-
 def parse_continue_message(
     checkpoint: str,
     pending_payload: dict[str, Any],
@@ -638,16 +635,13 @@ def parse_continue_message(
     req_overrides: dict[str, Any] | None = None,
     req_approved: bool = True,
 ) -> dict[str, Any]:
-    """LLM-first continue parsing; rule-based only as fallback."""
+    """LLM-only continue parsing: never merge rule-based overrides."""
     approved = bool(req_approved)
     overrides = normalize_continue_overrides(checkpoint, req_overrides or {})
 
     text = str(user_message or "").strip()
     if not text:
         return {"approved": approved, "overrides": overrides}
-
-    intent_ctx = pending_payload.get("intent") if isinstance(pending_payload.get("intent"), dict) else pending_payload
-    default_province = str((intent_ctx or {}).get("province") or "河北")
 
     try:
         llm_parsed = _parse_continue_message_with_llm(checkpoint, pending_payload, text)
@@ -656,24 +650,8 @@ def parse_continue_message(
         if isinstance(llm_overrides, dict) and llm_overrides:
             overrides = {**overrides, **llm_overrides}
     except Exception as exc:
-        logger.warning(f"parse_continue_message LLM 解析失败，回退规则: {exc}")
-        rule_parsed = _parse_continue_message_rule_based(
-            checkpoint, text, default_province=default_province
-        )
-        approved = bool(rule_parsed.get("approved", approved))
-        rule_overrides = rule_parsed.get("overrides")
-        if isinstance(rule_overrides, dict) and rule_overrides:
-            overrides = {**overrides, **normalize_continue_overrides(checkpoint, rule_overrides)}
-        return {"approved": approved, "overrides": overrides}
-
-    rule_parsed = _parse_continue_message_rule_based(checkpoint, text, default_province=default_province)
-    rule_overrides = normalize_continue_overrides(
-        checkpoint,
-        rule_parsed.get("overrides") if isinstance(rule_parsed.get("overrides"), dict) else {},
-    )
-    for key, value in rule_overrides.items():
-        if key not in overrides or overrides.get(key) in (None, "", []):
-            overrides[key] = value
+        logger.warning(f"parse_continue_message LLM 解析失败（无规则兜底）: {exc}")
+        raise ValueError("继续确认解析失败，请重试。") from exc
 
     return {"approved": approved, "overrides": overrides}
 
