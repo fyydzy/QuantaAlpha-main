@@ -1,11 +1,17 @@
-"""Single-round orchestrated gas forecast flow (M1).
+"""燃气预测编排层（第三版核心）。
+
+Web 与 CLI 共用本模块的业务函数；Web 在 app.py 的 _run_forecast_agent 里按阶段调用，
+并在两个人机确认点之间插入 _wait_for_continue。
 
 Pipeline:
-1) parse intent from query
-2) run xgboost baseline and collect feature importance
-3) ask LLM to recommend one feature superset (importance-driven)
-4) run multi-model auto selection with per-model feature projection
-5) build decadal + monthly rollup summary
+1) parse_intent — LLM 解析 query → 结构化 intent
+2) diagnose_importance — 全特征 xgboost，产出 feature_importance（与最终特征无关）
+3) recommend_feature_superset — LLM 推荐特征超集
+4) run_compare_and_rollup — 逐模型投影 + auto 比选 + 月度汇总
+5) ask_flow_qa（可选）— 读预测表问答
+
+人机确认覆写：parse_continue_message → normalize_continue_overrides → apply_intent_overrides
+字段提取仅 LLM；特征池 FEATURE_REGISTRY 仅作校验过滤。
 """
 
 from __future__ import annotations
@@ -83,6 +89,7 @@ def _coerce_decadal_date(raw: Any) -> str | None:
 
 
 def _normalize_province_name(raw: Any, *, default_province: str) -> str:
+    """省份简称归一化（去省/市/自治区后缀）。不负责判断用户是否提及省份，那由 LLM prompt 决定。"""
     text = str(raw or "").strip()
     if not text:
         text = str(default_province or "").strip()
@@ -96,6 +103,7 @@ def _normalize_province_name(raw: Any, *, default_province: str) -> str:
 
 
 def _parse_intent_with_llm(query: str, *, default_province: str) -> dict[str, Any]:
+    """首轮意图：调 LLM，prompt 内含单月/跨月示例。不做正则从 query 抠字段。"""
     system_prompt = (
         "你是天然气预测参数解析助手。"
         "请把用户自然语言需求解析为结构化参数。"
@@ -160,18 +168,12 @@ def _parse_intent_with_llm(query: str, *, default_province: str) -> dict[str, An
 
 
 def parse_intent(query: str, *, default_province: str, as_of_month: str | None = None) -> dict[str, str]:
-    """Parse forecasting intent with explicit date rules.
+    """从用户 query 解析预测 intent（Web 阶段 0 / CLI 第一步）。
 
-    Rules:
-    1) target_month:
-       - Must come from LLM parsed value.
-       - Missing value -> raise (no rule extraction fallback).
-    2) test_start/test_end:
-       - If both are provided and valid decadal dates, use them.
-       - If both are missing, derive from target_month: YYYY-MM-01 ~ YYYY-MM-21.
-       - If only one side is provided -> raise.
-    3) as_of_month:
-       - Fixed to the configured as_of date (no LLM parse, no rule fallback).
+    规则摘要：
+    - target_month 必须来自 LLM，缺失则报错（无正则兜底）
+    - test_start/end：LLM 同时给出则用；都缺则从 target_month 推当月 01~21；只给一侧报错
+    - as_of_month 固定 FIXED_AS_OF_DATE，不由 query 解析
     """
     try:
         llm_obj = _parse_intent_with_llm(query, default_province=default_province)
@@ -207,7 +209,7 @@ def parse_intent(query: str, *, default_province: str, as_of_month: str | None =
 
 
 def apply_intent_overrides(intent: dict[str, str], overrides: dict[str, Any]) -> dict[str, str]:
-    """Merge confirmation overrides into intent; keep target_month and decadal range aligned."""
+    """合并 confirm_intent 覆写：null/空字段不改动；只改 target_month 时自动同步 test 区间。"""
     if not overrides:
         return intent
 
@@ -305,6 +307,7 @@ def _project_feature_superset_by_model(models: list[str], feature_superset: list
 
 
 def diagnose_importance(intent: dict[str, str], *, output_dir: Path, context_len: int) -> dict[str, Any]:
+    """阶段 1：全特征 xgboost 基线，读取 feature_importance 供推荐用（不用用户确认的特征集）。"""
     diag_dir = output_dir / "_diagnose_xgboost"
     cfg = ForecastRunConfig(
         model="xgboost",
@@ -342,6 +345,7 @@ def recommend_feature_superset(
     required_features: list[str] | None = None,
     intent: dict[str, str] | None = None,
 ) -> dict[str, Any]:
+    """阶段 2：LLM 结合重要性 Top-K + 特征池推荐一组 feature_superset（须传入已确认 intent）。"""
     top_items = importance_items[: max(1, int(top_k))]
     feature_pool_json = feature_pool_for_prompt()
     required = [f for f in (required_features or ["HDD", "Lag_36"]) if f in FEATURE_REGISTRY]
@@ -410,7 +414,7 @@ def recommend_feature_superset(
 
 
 def normalize_continue_overrides(checkpoint: str, overrides: dict[str, Any]) -> dict[str, Any]:
-    """Normalize LLM/rule overrides into flat keys used by the agent flow."""
+    """把 LLM 返回的 overrides 整理为扁平字段；confirm_features 时过滤 FEATURE_REGISTRY（校验非提取）。"""
     raw = dict(overrides or {})
     if isinstance(raw.get("intent"), dict):
         raw = {**raw.get("intent"), **raw}
@@ -573,6 +577,7 @@ def _parse_continue_message_with_llm(
     pending_payload: dict[str, Any],
     user_message: str,
 ) -> dict[str, Any]:
+    """人机确认：LLM 解析 approved + overrides；丢弃 null/空字段，不臆造未提及项。"""
     if checkpoint == "confirm_intent":
         system_prompt, user_prompt = _continue_intent_prompt(pending_payload, user_message)
     elif checkpoint == "confirm_features":
@@ -635,7 +640,7 @@ def parse_continue_message(
     req_overrides: dict[str, Any] | None = None,
     req_approved: bool = True,
 ) -> dict[str, Any]:
-    """LLM-only continue parsing: never merge rule-based overrides."""
+    """Web continue 入口：仅 LLM 解析用户回复；失败抛 ValueError，无规则兜底。"""
     approved = bool(req_approved)
     overrides = normalize_continue_overrides(checkpoint, req_overrides or {})
 
@@ -797,6 +802,7 @@ def run_compare_and_rollup(
     context_len: int,
     candidate_models: str,
 ) -> dict[str, Any]:
+    """阶段 3：按模型投影特征 → runner auto 比选 → 月度 rollup。"""
     candidate_models = _normalize_candidate_models(candidate_models)
     models = [m.strip().lower() for m in candidate_models.split(",") if m.strip()]
     if not models:
@@ -845,6 +851,7 @@ def run_compare_and_rollup(
 
 
 def run_gas_forecast_flow(config: GasForecastFlowConfig) -> dict[str, Any]:
+    """CLI 一条龙：无两个人机确认点，顺序调用各阶段函数。"""
     if not str(config.query).strip():
         raise ValueError("query 不能为空")
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")

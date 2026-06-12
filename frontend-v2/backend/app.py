@@ -124,7 +124,7 @@ class ApiResponse(BaseModel):
 
 tasks: Dict[str, Dict[str, Any]] = {}
 ws_connections: Dict[str, List[WebSocket]] = {}  # task_id -> list of WS
-# Forecast agent pause/resume handles (must not live on task dict — breaks JSON API)
+# 燃气预测智能体：人机确认暂停/续跑句柄（必须放模块级，不能放进 tasks[task_id]，否则 GET 任务 JSON 序列化失败）
 _forecast_continue_events: Dict[str, asyncio.Event] = {}
 _forecast_continue_payloads: Dict[str, Dict[str, Any]] = {}
 
@@ -1405,7 +1405,13 @@ async def _run_forecast_agent(
     req: ForecastAgentStartRequest,
     output_dir: str,
 ):
-    """Run forecast agent flow with stage-wise progress/messages."""
+    """燃气预测智能体主协程（Web 专用）。
+
+    职责：驱动 gas_forecast_flow 各阶段、推送聊天消息、在两个人机确认点挂起等待。
+    业务规则（意图/覆写/LLM prompt）在 gas_forecast_flow.py，本函数只做任务状态与 WS 广播。
+
+    阅读顺序：_emit_stage → _wait_for_continue → 下方「阶段 0~5」顺序块 → continue_forecast_agent。
+    """
     task = tasks[task_id]
     try:
         # Ensure .env credentials are visible in current process
@@ -1440,6 +1446,7 @@ async def _run_forecast_agent(
             return dict(task["progress"])
 
         async def _emit_stage(stage: str, text: str, payload: Dict[str, Any], *, need_confirm: bool = False):
+            # 往聊天流追加一条助手消息，经 WS type=metrics 推给前端（ForecastPage / TaskContext）
             agent_message = {
                 "role": "assistant",
                 "stage": stage,
@@ -1471,6 +1478,8 @@ async def _run_forecast_agent(
             )
 
         async def _wait_for_continue(checkpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+            # 人机确认：挂起本协程，直到用户 POST .../continue 写入 payload 并 event.set()
+            # checkpoint: confirm_intent | confirm_features
             event = asyncio.Event()
             _forecast_continue_events[task_id] = event
             _forecast_continue_payloads.pop(task_id, None)
@@ -1518,6 +1527,7 @@ async def _run_forecast_agent(
             )
             return cont if isinstance(cont, dict) else {}
 
+        # --- 阶段 0：意图解析 + 确认点①（参数）---
         await _broadcast(task_id, {"type": "progress", "taskId": task_id, "data": _set_progress("parsing", 10, "解析用户意图..."), "timestamp": _now()})
         intent = await asyncio.to_thread(
             parse_intent,
@@ -1537,6 +1547,7 @@ async def _run_forecast_agent(
             intent = apply_intent_overrides(intent, intent_overrides)
             await _emit_stage("intent_applied", "好的，我已按你的要求更新了预测参数：", intent)
 
+        # --- 阶段 1：xgboost 全特征诊断（与用户最终特征无关，只产出 importance）---
         await _broadcast(task_id, {"type": "progress", "taskId": task_id, "data": _set_progress("analyzing", 30, "运行 xgboost 诊断并提取重要性..."), "timestamp": _now()})
         diagnose = await asyncio.to_thread(
             diagnose_importance,
@@ -1553,6 +1564,7 @@ async def _run_forecast_agent(
             },
         )
 
+        # --- 阶段 2：LLM 特征推荐 + 确认点②（特征）---
         await _broadcast(task_id, {"type": "progress", "taskId": task_id, "data": _set_progress("planning", 50, "LLM 推荐特征组合..."), "timestamp": _now()})
         recommend = await asyncio.to_thread(
             recommend_feature_superset,
@@ -1596,6 +1608,7 @@ async def _run_forecast_agent(
                 },
             )
 
+        # --- 阶段 3：多模型比选 + 月度汇总（无第三个人机确认点）---
         await _broadcast(task_id, {"type": "progress", "taskId": task_id, "data": _set_progress("forecasting", 75, "执行多模型比选与预测..."), "timestamp": _now()})
         compare = await asyncio.to_thread(
             run_compare_and_rollup,
@@ -1633,6 +1646,7 @@ async def _run_forecast_agent(
             "output_dir": str(out_root),
         }
 
+        # --- 阶段 4（可选）：启动时预填 qaQuery 则自动问答一次；完成后多轮追问走 POST /forecast/qa ---
         if req.qaQuery and str(req.qaQuery).strip() and selected_model:
             await _broadcast(task_id, {"type": "progress", "taskId": task_id, "data": _set_progress("qa", 90, "生成问答结果..."), "timestamp": _now()})
             qa = await asyncio.to_thread(
@@ -1741,6 +1755,11 @@ async def cancel_forecast_agent(task_id: str):
 
 @app.post("/api/v1/forecast/agent/{task_id}/continue", response_model=ApiResponse)
 async def continue_forecast_agent(task_id: str, req: ForecastAgentContinueRequest):
+    """用户在人机确认点的回复入口。
+
+    调用 gas_forecast_flow.parse_continue_message（仅 LLM 解析 approved/overrides），
+    写入 _forecast_continue_payloads 并唤醒 _wait_for_continue 中阻塞的协程。
+    """
     if task_id not in tasks:
         raise HTTPException(status_code=404, detail="Task not found")
     task = tasks[task_id]
