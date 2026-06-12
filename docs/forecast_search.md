@@ -1,4 +1,10 @@
-# 如何运行
+# forecast_search（历史能力说明）
+
+> 状态：`forecast_search` 的 Web 界面与后端接口已下线；当前推荐使用对话式燃气预测主流程（`forecast_flow` / Web 燃气预测页）。
+>
+> 你提到的“前后端运行命令”仍保留在本文档，便于本地启动开发环境。
+
+## 如何运行（历史）
 
 ## 1）准备环境
 
@@ -23,10 +29,10 @@ uv sync --extra forecast
 - `forecast.model`（第一版建议固定 `xgboost` 或 `random_forest`）
 - `analysis.enabled: true`（自动生成总结）
 
-## 3）一条命令运行（生成 leaderboard + feedback）
+## 3）历史命令（生成 leaderboard + feedback）
 
 ```powershell
-uv run quantaalpha forecast_search --config configs/forecast_search.yaml
+uv run python -m quantaalpha.forecast_agent.solution_search --config configs/forecast_search.yaml
 ```
 
 默认输出会写到 `forecast_agent_output/{province}/` 下（见 `configs/forecast_search.yaml` 的 `output.*` 配置）：
@@ -49,7 +55,7 @@ uv run python -c "from quantaalpha.forecast_agent.forecast_feedback import Feedb
 - `output_dir`：换成你实际的输出目录（一般是 `forecast_agent_output/{province}`）
 - `goal`：可改成你这次希望 LLM 总结聚焦的目标
 
-## 5）Web UI 运行命令（可视化跑方案/看榜单/点按钮只生成总结）
+## 5）前后端运行命令（保留）
 
 终端 1（后端 FastAPI）：
 

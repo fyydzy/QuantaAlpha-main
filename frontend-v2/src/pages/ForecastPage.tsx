@@ -1,85 +1,45 @@
-import React, { useEffect, useRef, useState } from 'react';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/Card';
-import { Button } from '@/components/ui/Button';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Badge } from '@/components/ui/Badge';
+import { Progress } from '@/components/ui/Progress';
 import {
-  Play,
-  Square,
-  Loader2,
-  TrendingUp,
   AlertCircle,
+  Bot,
+  ChevronDown,
+  ChevronUp,
   Flame,
+  Loader2,
+  Send,
+  Settings2,
+  Square,
 } from 'lucide-react';
-import {
-  LineChart,
-  Line,
-  XAxis,
-  YAxis,
-  CartesianGrid,
-  Tooltip,
-  Legend,
-  ResponsiveContainer,
-} from 'recharts';
 import { useTaskContext } from '@/context/TaskContext';
-import { formatNumber } from '@/utils';
+import type { ForecastAgentMessage } from '@/context/TaskContext';
 import { askForecastQa } from '@/services/api';
 
-const MODEL_OPTIONS = [
-  { value: 'auto', label: '自动比选 (auto)' },
-  { value: 'lasso', label: 'Lasso' },
-  { value: 'ridge', label: 'Ridge' },
-  { value: 'elasticnet', label: 'ElasticNet' },
-  { value: 'lstm', label: 'LSTM' },
-  { value: 'xgboost', label: 'XGBoost' },
-  { value: 'lightgbm', label: 'LightGBM' },
-  { value: 'catboost', label: 'CatBoost' },
-  { value: 'random_forest', label: 'Random Forest' },
-  { value: 'sarimax', label: 'SARIMAX' },
-];
+function getForecastQaContext(metrics: Record<string, any>) {
+  const compare = metrics.compare || {};
+  const recommend = metrics.recommend || {};
+  return {
+    outputDir: String(metrics.output_dir || metrics.outputDir || '').trim(),
+    model: String(
+      metrics.selected_model || compare.best_model || compare.bestModel || '',
+    ).trim(),
+    selectedFeatures: (recommend.feature_superset || recommend.featureSuperset || []) as string[],
+  };
+}
 
-const TABULAR_FEATURE_OPTIONS = [
-  'avg_temp',
-  'max_temp',
-  'min_temp',
-  'HDD',
-  'extreme_cold_days',
-  'temp_range',
-  'time_index',
-  'month_sin',
-  'month_cos',
-  'ten_sin',
-  'ten_cos',
-  'is_heating_season',
-  'spring_rework_peak',
-  'Lag_36',
-  'HDD_squared',
-  'HDD_cross_Lag_36',
-  'HDD_cross_HeatingSeason',
-  'HDD_cross_spring_rework_peak',
-  'ColdDays_cross_Lag_36',
+const QA_EXAMPLE_PROMPTS = [
+  '哪几个旬误差最大？',
+  '预测整体偏高还是偏低？',
+  '目标月各旬实际和预测分别是多少？',
 ];
-
-const FEATURE_OPTIONS_BY_MODEL: Record<string, string[]> = {
-  lasso: TABULAR_FEATURE_OPTIONS,
-  ridge: TABULAR_FEATURE_OPTIONS,
-  elasticnet: TABULAR_FEATURE_OPTIONS,
-  xgboost: TABULAR_FEATURE_OPTIONS,
-  lightgbm: TABULAR_FEATURE_OPTIONS,
-  catboost: TABULAR_FEATURE_OPTIONS,
-  random_forest: TABULAR_FEATURE_OPTIONS,
-  sarimax: ['avg_temp', 'max_temp', 'min_temp', 'HDD', 'extreme_cold_days', 'temp_range'],
-  lstm: ['Lag_36', 'HDD', 'is_heating_season'],
-};
 
 function renderInlineMarkdown(text: string, keyPrefix: string): React.ReactNode {
   const parts = text.split(/(`[^`]+`|\*\*[^*]+\*\*)/g).filter(Boolean);
   return parts.map((part, idx) => {
     if (part.startsWith('`') && part.endsWith('`')) {
       return (
-        <code
-          key={`${keyPrefix}-code-${idx}`}
-          className="px-1.5 py-0.5 rounded bg-black/30 text-amber-300 text-xs"
-        >
+        <code key={`${keyPrefix}-code-${idx}`} className="px-1.5 py-0.5 rounded bg-black/30 text-amber-300 text-xs">
           {part.slice(1, -1)}
         </code>
       );
@@ -91,523 +51,676 @@ function renderInlineMarkdown(text: string, keyPrefix: string): React.ReactNode 
         </strong>
       );
     }
-    return <React.Fragment key={`${keyPrefix}-text-${idx}`}>{part}</React.Fragment>;
+    return <React.Fragment key={`${keyPrefix}-txt-${idx}`}>{part}</React.Fragment>;
   });
 }
 
 function renderMarkdownLike(answer: string): React.ReactNode {
-  const nodes: React.ReactNode[] = [];
-  const chunks = answer.split(/```/);
-  let listBuffer: { type: 'ul' | 'ol'; items: string[] } | null = null;
-
-  const flushList = (keyBase: string) => {
-    if (!listBuffer || listBuffer.items.length === 0) return;
-    if (listBuffer.type === 'ul') {
-      nodes.push(
-        <ul key={`${keyBase}-ul`} className="list-disc pl-5 space-y-1">
-          {listBuffer.items.map((it, i) => (
-            <li key={`${keyBase}-uli-${i}`} className="text-sm leading-6">
-              {renderInlineMarkdown(it, `${keyBase}-uli-${i}`)}
-            </li>
-          ))}
-        </ul>,
-      );
-    } else {
-      nodes.push(
-        <ol key={`${keyBase}-ol`} className="list-decimal pl-5 space-y-1">
-          {listBuffer.items.map((it, i) => (
-            <li key={`${keyBase}-oli-${i}`} className="text-sm leading-6">
-              {renderInlineMarkdown(it, `${keyBase}-oli-${i}`)}
-            </li>
-          ))}
-        </ol>,
-      );
-    }
-    listBuffer = null;
-  };
-
-  chunks.forEach((chunk, chunkIdx) => {
-    const keyBase = `md-${chunkIdx}`;
-    // odd chunk index = code block content
-    if (chunkIdx % 2 === 1) {
-      flushList(`${keyBase}-before-code`);
-      const codeText = chunk.replace(/^\s*\n/, '').replace(/\n\s*$/, '');
-      nodes.push(
-        <pre
-          key={`${keyBase}-code`}
-          className="overflow-x-auto rounded-lg bg-black/40 border border-border p-3 text-xs text-slate-100 leading-6"
-        >
-          <code>{codeText}</code>
-        </pre>,
-      );
-      return;
-    }
-
-    const lines = chunk.split('\n');
-    lines.forEach((rawLine, lineIdx) => {
-      const line = rawLine.trim();
-      const lineKey = `${keyBase}-line-${lineIdx}`;
-      if (!line) {
-        // Keep current list across blank lines; many LLM outputs place an empty line
-        // between numbered items, and flushing here would restart numbering at 1.
-        if (!listBuffer) {
-          flushList(`${lineKey}-blank`);
+  const lines = String(answer || '').split('\n');
+  return (
+    <div className="space-y-2">
+      {lines.map((line, i) => {
+        const l = line.trim();
+        if (!l) return <div key={`empty-${i}`} className="h-1" />;
+        const ul = l.match(/^[-*]\s+(.+)$/);
+        if (ul) {
+          return (
+            <div key={`ul-${i}`} className="text-sm leading-6 pl-4">
+              • {renderInlineMarkdown(ul[1], `ul-${i}`)}
+            </div>
+          );
         }
-        return;
-      }
-
-      const ulMatch = line.match(/^[-*]\s+(.+)$/);
-      if (ulMatch) {
-        if (!listBuffer || listBuffer.type !== 'ul') {
-          flushList(`${lineKey}-switch-ul`);
-          listBuffer = { type: 'ul', items: [] };
+        const ol = l.match(/^\d+\.\s+(.+)$/);
+        if (ol) {
+          return (
+            <div key={`ol-${i}`} className="text-sm leading-6 pl-4">
+              {renderInlineMarkdown(ol[1], `ol-${i}`)}
+            </div>
+          );
         }
-        listBuffer.items.push(ulMatch[1]);
-        return;
-      }
-
-      const olMatch = line.match(/^\d+\.\s+(.+)$/);
-      if (olMatch) {
-        if (!listBuffer || listBuffer.type !== 'ol') {
-          flushList(`${lineKey}-switch-ol`);
-          listBuffer = { type: 'ol', items: [] };
-        }
-        listBuffer.items.push(olMatch[1]);
-        return;
-      }
-
-      flushList(`${lineKey}-before-text`);
-
-      const heading = line.match(/^(#{1,3})\s+(.+)$/);
-      if (heading) {
-        const level = heading[1].length;
-        const title = heading[2];
-        const cls =
-          level === 1
-            ? 'text-base font-semibold'
-            : level === 2
-              ? 'text-sm font-semibold'
-              : 'text-sm font-medium';
-        nodes.push(
-          <div key={`${lineKey}-h`} className={`${cls} text-foreground mt-1`}>
-            {renderInlineMarkdown(title, `${lineKey}-h`)}
-          </div>,
+        return (
+          <p key={`p-${i}`} className="text-sm leading-6 text-foreground/90">
+            {renderInlineMarkdown(l, `p-${i}`)}
+          </p>
         );
-        return;
-      }
+      })}
+    </div>
+  );
+}
 
-      nodes.push(
-        <p key={`${lineKey}-p`} className="text-sm leading-6 text-foreground/90">
-          {renderInlineMarkdown(line, `${lineKey}-p`)}
-        </p>,
-      );
-    });
-  });
+const EXAMPLE_PROMPTS = [
+  '预测2026年4月河北天然气销量',
+  '预测2025年12月山东天然气销量',
+  '预测2026年3月北京天然气销量，重点关注采暖季',
+];
 
-  flushList('md-end');
-  return <div className="space-y-2">{nodes}</div>;
+const QUICK_REPLIES: Record<string, string[]> = {
+  confirm_intent: ['好的，继续', '改成山东', '目标月改为2026年5月'],
+  confirm_features: ['好的，继续', '去掉 HDD_squared', '加上 max_temp'],
+};
+
+function StagePayload({ stage, payload }: { stage: string; payload: any }) {
+  if (!payload || typeof payload !== 'object') return null;
+
+  const panel = (children: React.ReactNode) => (
+    <div className="mt-3 rounded-lg border border-border/50 bg-secondary/20 p-3 text-sm">{children}</div>
+  );
+
+  if (stage === 'parse_intent' || stage === 'intent_applied' || stage === 'confirm_intent') {
+    const data = payload.intent || payload;
+    return panel(
+      <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-xs">
+        <div><span className="text-muted-foreground">省份</span> {data.province || '-'}</div>
+        <div><span className="text-muted-foreground">目标月</span> {data.target_month || '-'}</div>
+        <div><span className="text-muted-foreground">测试起</span> {data.test_start || '-'}</div>
+        <div><span className="text-muted-foreground">测试止</span> {data.test_end || '-'}</div>
+        <div className="col-span-2"><span className="text-muted-foreground">截止旬</span> {data.as_of_month || '-'}</div>
+      </div>,
+    );
+  }
+
+  if (stage === 'diagnose') {
+    const top = Array.isArray(payload.topFeatures) ? payload.topFeatures.slice(0, 8) : [];
+    return panel(
+      <div className="space-y-2">
+        {top.length > 0 && (
+          <div className="flex flex-wrap gap-1.5">
+            {top.map((x: any, i: number) => (
+              <Badge key={`f-${i}`} variant="outline" className="text-xs font-normal">
+                {x.name} ({Number(x.score).toFixed(3)})
+              </Badge>
+            ))}
+          </div>
+        )}
+      </div>,
+    );
+  }
+
+  if (stage === 'recommend' || stage === 'features_applied' || stage === 'confirm_features') {
+    const fs = Array.isArray(payload.featureSuperset) ? payload.featureSuperset : [];
+    return panel(
+      <div className="space-y-2">
+        <div className="flex flex-wrap gap-1.5">
+          {fs.map((f: string) => (
+            <Badge key={f} variant="outline" className="text-xs font-normal">
+              {f}
+            </Badge>
+          ))}
+        </div>
+        {payload.reason && <p className="text-xs text-muted-foreground leading-relaxed">{payload.reason}</p>}
+      </div>,
+    );
+  }
+
+  if (stage === 'compare') {
+    const rows = Array.isArray(payload.leaderboard) ? payload.leaderboard.slice(0, 8) : [];
+    const rollup = Array.isArray(payload.monthlyRollup) ? payload.monthlyRollup : [];
+    return panel(
+      <div className="space-y-3">
+        {payload.bestModel && (
+          <div className="text-sm">
+            最优模型：<span className="font-semibold text-orange-400">{payload.bestModel}</span>
+          </div>
+        )}
+        {rows.length > 0 && (
+          <div className="overflow-x-auto">
+            <table className="min-w-full text-xs">
+              <thead>
+                <tr className="text-muted-foreground border-b border-border/40">
+                  <th className="py-1.5 text-left font-medium">模型</th>
+                  <th className="py-1.5 text-right font-medium">MAPE%</th>
+                  <th className="py-1.5 text-right font-medium">RMSE</th>
+                  <th className="py-1.5 text-right font-medium">R²</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((r: any, i: number) => (
+                  <tr key={`cmp-${i}`} className="border-b border-border/20">
+                    <td className="py-1.5">{r.model}</td>
+                    <td className="py-1.5 text-right">{r.MAPE?.toFixed?.(3) ?? '-'}</td>
+                    <td className="py-1.5 text-right">{r.RMSE?.toFixed?.(1) ?? '-'}</td>
+                    <td className="py-1.5 text-right">{r.R2?.toFixed?.(4) ?? '-'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+        {rollup.length > 0 && (
+          <div>
+            <div className="text-xs text-muted-foreground mb-1">月度汇总</div>
+            <div className="overflow-x-auto">
+              <table className="min-w-full text-xs">
+                <thead>
+                  <tr className="text-muted-foreground border-b border-border/40">
+                    <th className="py-1 text-left">月份</th>
+                    <th className="py-1 text-right">预测</th>
+                    <th className="py-1 text-right">实际</th>
+                    <th className="py-1 text-right">MAPE%</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rollup.map((r: any, i: number) => (
+                    <tr key={`m-${i}`} className="border-b border-border/20">
+                      <td className="py-1">{r.month}</td>
+                      <td className="py-1 text-right">{Number(r.predicted_gas_sales ?? 0).toFixed(0)}</td>
+                      <td className="py-1 text-right">
+                        {r.actual_gas_sales == null ? '-' : Number(r.actual_gas_sales).toFixed(0)}
+                      </td>
+                      <td className="py-1 text-right">
+                        {r.mape_pct == null ? '-' : Number(r.mape_pct).toFixed(2)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+      </div>,
+    );
+  }
+
+  if (stage === 'qa' && payload.answer) {
+    return panel(renderMarkdownLike(String(payload.answer)));
+  }
+
+  return panel(
+    <pre className="text-xs overflow-x-auto">{JSON.stringify(payload, null, 2)}</pre>,
+  );
+}
+
+function UserBubble({ text }: { text: string }) {
+  return (
+    <div className="flex justify-end mb-5">
+      <div className="max-w-[min(85%,32rem)] rounded-2xl rounded-tr-md bg-primary text-primary-foreground px-4 py-2.5 text-sm leading-relaxed shadow-sm">
+        {text}
+      </div>
+    </div>
+  );
+}
+
+function AssistantBlock({
+  msg,
+  renderPayload,
+}: {
+  msg: ForecastAgentMessage;
+  renderPayload: (stage: string, payload: any) => React.ReactNode;
+}) {
+  return (
+    <div className="flex gap-3 mb-6 group">
+      <div className="shrink-0 w-8 h-8 rounded-full bg-orange-500/15 border border-orange-500/25 flex items-center justify-center mt-0.5">
+        <Bot className="h-4 w-4 text-orange-500" />
+      </div>
+      <div className="flex-1 min-w-0 pt-0.5">
+        <div className="flex items-center gap-2 mb-1">
+          <span className="text-xs font-medium text-muted-foreground">燃气预测助手</span>
+          {msg.needConfirm && (
+            <Badge variant="outline" className="text-[10px] h-5 px-1.5">
+              待你确认
+            </Badge>
+          )}
+        </div>
+        <p className="text-sm leading-relaxed text-foreground/95">{msg.text}</p>
+        {renderPayload(msg.stage, msg.payload)}
+      </div>
+    </div>
+  );
+}
+
+function TypingIndicator() {
+  return (
+    <div className="flex gap-3 mb-4">
+      <div className="shrink-0 w-8 h-8 rounded-full bg-orange-500/15 border border-orange-500/25 flex items-center justify-center">
+        <Bot className="h-4 w-4 text-orange-500" />
+      </div>
+      <div className="flex items-center gap-1 pt-2">
+        <span className="w-2 h-2 rounded-full bg-muted-foreground/50 animate-bounce [animation-delay:0ms]" />
+        <span className="w-2 h-2 rounded-full bg-muted-foreground/50 animate-bounce [animation-delay:150ms]" />
+        <span className="w-2 h-2 rounded-full bg-muted-foreground/50 animate-bounce [animation-delay:300ms]" />
+      </div>
+    </div>
+  );
 }
 
 export const ForecastPage: React.FC = () => {
   const {
     backendAvailable,
-    forecastTask: task,
-    forecastLogs: logs,
-    startForecastTask,
-    stopForecastTask,
+    forecastAgentTask,
+    forecastAgentLogs,
+    forecastAgentMessages,
+    startForecastAgentTask,
+    continueForecastAgentTask,
+    stopForecastAgentTask,
   } = useTaskContext();
 
+  const [input, setInput] = useState('');
   const [province, setProvince] = useState('河北');
-  const [model, setModel] = useState('auto');
-  const [asOfMonth, setAsOfMonth] = useState('2025-06-21');
-  const [testStart, setTestStart] = useState('2025-11-01');
-  const [testEnd, setTestEnd] = useState('2026-03-21');
-  const [contextLen, setContextLen] = useState(270);
-  const [selectedFeatures, setSelectedFeatures] = useState<string[]>([]);
-  const [isStarting, setIsStarting] = useState(false);
   const [qaQuery, setQaQuery] = useState('');
-  const [qaAnswer, setQaAnswer] = useState('');
-  const [qaError, setQaError] = useState('');
-  const [qaLoading, setQaLoading] = useState(false);
-  const [qaMeta, setQaMeta] = useState<{ modelUsed: string; rowsUsed: number; dataMode: string } | null>(null);
-  const logsEndRef = useRef<HTMLDivElement>(null);
-  const modelFeatureOptions = FEATURE_OPTIONS_BY_MODEL[model] || [];
+  const [contextLen, setContextLen] = useState(270);
+  const [showSettings, setShowSettings] = useState(false);
+  const [showLogs, setShowLogs] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [followUpMessages, setFollowUpMessages] = useState<ForecastAgentMessage[]>([]);
+  const [qaMode, setQaMode] = useState(true);
+
+  const chatEndRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  const running = forecastAgentTask?.status === 'running';
+  const completed = forecastAgentTask?.status === 'completed';
+  const metrics = forecastAgentTask?.metrics || {};
+  const qaContext = useMemo(() => getForecastQaContext(metrics), [metrics]);
+  const canAskQa = completed && qaMode && !!qaContext.outputDir && !!qaContext.model;
 
   useEffect(() => {
-    logsEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [logs]);
+    if (completed) setQaMode(true);
+  }, [completed, forecastAgentTask?.taskId]);
+  const awaiting = (metrics.awaiting_confirmation || null) as any;
+  const taskQuery = String((forecastAgentTask?.config as any)?.query || '').trim();
+  const progressValue = Number(forecastAgentTask?.progress?.progress || 0);
+  const progressMessage = String(forecastAgentTask?.progress?.message || '');
+
+  const awaitingCheckpoint = awaiting?.checkpoint as string | undefined;
+  const canReply = running && !!awaitingCheckpoint;
+  const isBusy = submitting || (running && !canReply);
+
+  const quickReplies = awaitingCheckpoint ? QUICK_REPLIES[awaitingCheckpoint] || [] : [];
 
   useEffect(() => {
-    setSelectedFeatures((prev) => prev.filter((f) => modelFeatureOptions.includes(f)));
-  }, [model]);
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [forecastAgentMessages, followUpMessages, awaitingCheckpoint, running, taskQuery]);
 
   useEffect(() => {
-    setQaAnswer('');
-    setQaError('');
-    setQaMeta(null);
-  }, [task?.taskId, task?.status]);
+    const el = textareaRef.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = `${Math.min(el.scrollHeight, 140)}px`;
+  }, [input]);
 
-  const toggleFeature = (feature: string) => {
-    setSelectedFeatures((prev) => (
-      prev.includes(feature)
-        ? prev.filter((f) => f !== feature)
-        : [...prev, feature]
-    ));
-  };
+  const handleSend = useCallback(async () => {
+    const text = input.trim();
+    if (!text || submitting) return;
 
-  const handleStart = async () => {
-    setIsStarting(true);
-    try {
-      const modelFeatures = model !== 'auto' && modelFeatureOptions.length > 0 && selectedFeatures.length > 0
-        ? { [model]: selectedFeatures }
-        : undefined;
-      await startForecastTask({
-        model,
-        province,
-        asOfMonth,
-        testStart,
-        testEnd,
-        contextLen,
-        outputDir: `forecast_agent_output/${province}`,
-        modelFeatures,
-      });
-    } catch (err) {
-      console.error('Failed to start forecast:', err);
-    } finally {
-      setIsStarting(false);
-    }
-  };
-
-  const isRunning = task?.status === 'running';
-  const metrics = task?.metrics || {};
-  const testMetrics = metrics.test_metrics || {};
-  const curve = metrics.forecast_curve || [];
-  const hasActual = curve.some((p: { y?: number }) => p.y != null && !Number.isNaN(p.y));
-  const qaModel = String(metrics.display_model || metrics.best_model || model || '').trim();
-  const qaOutputDir = String(task?.config?.outputDir || `forecast_agent_output/${province}`);
-
-  const handleAskQa = async () => {
-    const query = qaQuery.trim();
-    if (!query) return;
-    if (!qaModel || qaModel === 'auto' || qaModel === 'auto_select') {
-      setQaError('请先完成预测并确定具体模型，再进行问答。');
+    if (canAskQa) {
+      const now = new Date().toISOString();
+      const userMsg: ForecastAgentMessage = {
+        role: 'user',
+        stage: 'qa_followup',
+        messageType: 'user_reply',
+        text,
+        timestamp: now,
+      };
+      setFollowUpMessages((prev) => [...prev, userMsg]);
+      setInput('');
+      setSubmitting(true);
+      try {
+        const resp = await askForecastQa({
+          outputDir: qaContext.outputDir,
+          model: qaContext.model,
+          query: text,
+          selectedFeatures: qaContext.selectedFeatures,
+        });
+        if (!resp.success || !resp.data) {
+          throw new Error(resp.error || '问答失败');
+        }
+        const assistantMsg: ForecastAgentMessage = {
+          role: 'assistant',
+          stage: 'qa',
+          messageType: 'qa_answer',
+          text: '根据预测结果表，我的分析如下：',
+          payload: resp.data,
+          timestamp: new Date().toISOString(),
+        };
+        setFollowUpMessages((prev) => [...prev, assistantMsg]);
+      } catch (err) {
+        console.error('Failed to ask forecast QA:', err);
+        const errMsg: ForecastAgentMessage = {
+          role: 'assistant',
+          stage: 'qa',
+          messageType: 'qa_error',
+          text: `问答失败：${err instanceof Error ? err.message : String(err)}`,
+          timestamp: new Date().toISOString(),
+        };
+        setFollowUpMessages((prev) => [...prev, errMsg]);
+      } finally {
+        setSubmitting(false);
+      }
       return;
     }
-    setQaLoading(true);
-    setQaError('');
-    try {
-      const resp = await askForecastQa({
-        outputDir: qaOutputDir,
-        model: qaModel,
-        query,
-        selectedFeatures,
-      });
-      if (!resp.success || !resp.data) {
-        throw new Error(resp.error || '问答请求失败');
+
+    if (!forecastAgentTask || forecastAgentTask.status !== 'running') {
+      setSubmitting(true);
+      try {
+        setFollowUpMessages([]);
+        setQaMode(true);
+        await startForecastAgentTask({
+          query: text,
+          province,
+          contextLen,
+          candidateModels: 'catboost,elasticnet,lasso,lightgbm,lstm,random_forest,ridge,sarimax,xgboost',
+          qaQuery: qaQuery.trim() || undefined,
+        });
+        setInput('');
+      } catch (err) {
+        console.error('Failed to start forecast agent:', err);
+      } finally {
+        setSubmitting(false);
       }
-      setQaAnswer(resp.data.answer || '');
-      setQaMeta({
-        modelUsed: resp.data.modelUsed || '',
-        rowsUsed: Number(resp.data.rowsUsed || 0),
-        dataMode: resp.data.dataMode || '',
+      return;
+    }
+
+    if (!canReply) return;
+
+    setSubmitting(true);
+    try {
+      await continueForecastAgentTask({
+        checkpoint: awaitingCheckpoint,
+        message: text,
       });
-    } catch (err: any) {
-      setQaError(String(err?.message || err || '问答失败'));
+      setInput('');
+    } catch (err) {
+      console.error('Failed to continue forecast agent:', err);
     } finally {
-      setQaLoading(false);
+      setSubmitting(false);
+    }
+  }, [
+    input,
+    submitting,
+    forecastAgentTask,
+    canAskQa,
+    qaContext,
+    canReply,
+    awaitingCheckpoint,
+    province,
+    contextLen,
+    qaQuery,
+    startForecastAgentTask,
+    continueForecastAgentTask,
+  ]);
+
+  const handleNewForecast = useCallback(() => {
+    setFollowUpMessages([]);
+    setInput('');
+    setQaMode(false);
+  }, []);
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      handleSend();
     }
   };
 
+  const showWelcome = !forecastAgentTask && forecastAgentMessages.length === 0;
+
+  const renderPayload = useCallback((stage: string, payload: any) => {
+    return <StagePayload stage={stage} payload={payload} />;
+  }, []);
+
+  const placeholder = useMemo(() => {
+    if (canReply) {
+      return '回复助手：可直接说「继续」，或说明要改的省份、月份、特征…';
+    }
+    if (running) {
+      return '智能体正在处理，请稍候…';
+    }
+    if (canAskQa) {
+      return '继续追问预测结果，例如：哪几个旬误差最大？（Enter 发送）';
+    }
+    return '描述预测需求，例如：预测2026年4月河北天然气销量（Enter 发送，Shift+Enter 换行）';
+  }, [canReply, running, canAskQa]);
+
   return (
-    <div className="space-y-6 animate-fade-in-up">
-      <div>
-        <h1 className="text-3xl font-bold flex items-center gap-3">
-          <Flame className="h-8 w-8 text-orange-500" />
-          燃气旬度预测
-        </h1>
-        <p className="text-muted-foreground mt-1">
-          基于 processed_data 旬度 Excel，预测 bridge + test 各旬销量
-        </p>
+    <div className="flex flex-col h-[calc(100vh-5rem)] max-h-[900px] animate-fade-in-up">
+      {/* Header */}
+      <div className="shrink-0 pb-3 border-b border-border/40">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <h1 className="text-xl font-bold flex items-center gap-2">
+              <Flame className="h-6 w-6 text-orange-500" />
+              燃气预测智能体
+            </h1>
+            <p className="text-xs text-muted-foreground mt-0.5">
+              自然语言对话 · 意图解析 · 特征推荐 · 多模型比选 · 结果问答
+            </p>
+          </div>
+          <div className="flex items-center gap-2">
+            {canAskQa && (
+              <button
+                type="button"
+                onClick={handleNewForecast}
+                className="text-xs px-3 py-1.5 rounded-lg border border-border/60 hover:bg-secondary/50 transition-colors"
+              >
+                新预测
+              </button>
+            )}
+            {forecastAgentTask?.status && (
+              <Badge variant={forecastAgentTask.status === 'completed' ? 'default' : 'outline'}>
+                {forecastAgentTask.status}
+              </Badge>
+            )}
+          </div>
+        </div>
+
+        {backendAvailable === false && (
+          <div className="mt-2 flex items-center gap-2 text-xs text-destructive">
+            <AlertCircle className="h-4 w-4 shrink-0" />
+            后端未连接，请先启动 frontend-v2/backend/app.py
+          </div>
+        )}
+
+        {forecastAgentTask && running && (
+          <div className="mt-3 space-y-1">
+            <div className="flex justify-between text-xs text-muted-foreground">
+              <span>{progressMessage || '处理中…'}</span>
+              <span>{progressValue}%</span>
+            </div>
+            <Progress value={progressValue} />
+          </div>
+        )}
       </div>
 
-      {backendAvailable === false && (
-        <Card className="glass border-destructive/50">
-          <CardContent className="p-4 flex items-center gap-3">
-            <AlertCircle className="h-5 w-5 text-destructive" />
-            <span className="text-sm text-destructive">
-              后端未连接，请先运行 frontend-v2/start.sh
-            </span>
-          </CardContent>
-        </Card>
-      )}
-
-      <Card className="glass">
-        <CardHeader>
-          <CardTitle>任务配置</CardTitle>
-        </CardHeader>
-        <CardContent className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          <label className="text-sm">
-            <span className="text-muted-foreground">省份</span>
-            <input
-              className="mt-1 w-full rounded-lg bg-secondary/50 border border-border px-3 py-2"
-              value={province}
-              onChange={(e) => setProvince(e.target.value)}
-              disabled={isRunning}
-            />
-          </label>
-          <label className="text-sm">
-            <span className="text-muted-foreground">模型</span>
-            <select
-              className="mt-1 w-full rounded-lg bg-secondary/50 border border-border px-3 py-2"
-              value={model}
-              onChange={(e) => setModel(e.target.value)}
-              disabled={isRunning}
-            >
-              {MODEL_OPTIONS.map((o) => (
-                <option key={o.value} value={o.value}>
-                  {o.label}
-                </option>
-              ))}
-            </select>
-          </label>
-          <div className="text-sm md:col-span-2 lg:col-span-3">
-            <span className="text-muted-foreground">特征组合选择（当前模型）</span>
-            <div className="mt-2 rounded-lg bg-secondary/30 border border-border p-3">
-              {model === 'auto' && (
-                <p className="text-xs text-muted-foreground">
-                  auto 比选暂不支持在页面里统一指定特征；请先选择具体模型后再勾选特征。
-                </p>
-              )}
-              {model === 'timesfm' && (
-                <p className="text-xs text-muted-foreground">
-                  TimesFM 不使用 tabular 特征列，无需选择。
-                </p>
-              )}
-              {model !== 'auto' && model !== 'timesfm' && (
-                <>
-                  <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-2">
-                    {modelFeatureOptions.map((feature) => (
-                      <label
-                        key={feature}
-                        className="flex items-center gap-2 text-xs text-foreground/90"
-                      >
-                        <input
-                          type="checkbox"
-                          checked={selectedFeatures.includes(feature)}
-                          onChange={() => toggleFeature(feature)}
-                          disabled={isRunning}
-                        />
-                        <span>{feature}</span>
-                      </label>
-                    ))}
-                  </div>
-                  <p className="text-xs text-muted-foreground mt-2">
-                    不勾选任何特征时，仍按配置默认行为（通常为该模型默认全集）。
-                  </p>
-                </>
-              )}
+      {/* Chat area */}
+      <div className="flex-1 overflow-y-auto py-4 pr-1 scrollbar-thin">
+        {showWelcome && (
+          <div className="flex gap-3 mb-6">
+            <div className="shrink-0 w-8 h-8 rounded-full bg-orange-500/15 border border-orange-500/25 flex items-center justify-center">
+              <Bot className="h-4 w-4 text-orange-500" />
+            </div>
+            <div className="flex-1 pt-0.5">
+              <p className="text-sm leading-relaxed text-foreground/90">
+                你好，我是燃气销量预测助手。请直接告诉我你想预测哪个省份、哪个月份的销量，我会引导你确认参数和特征，然后自动完成多模型比选。
+              </p>
+              <div className="flex flex-wrap gap-2 mt-3">
+                {EXAMPLE_PROMPTS.map((p) => (
+                  <button
+                    key={p}
+                    type="button"
+                    onClick={() => setInput(p)}
+                    className="text-xs px-3 py-1.5 rounded-full border border-border/60 bg-secondary/30 hover:bg-secondary/60 transition-colors text-muted-foreground hover:text-foreground"
+                  >
+                    {p}
+                  </button>
+                ))}
+              </div>
             </div>
           </div>
-          <label className="text-sm">
-            <span className="text-muted-foreground">context_len（旬）</span>
-            <input
-              type="number"
-              className="mt-1 w-full rounded-lg bg-secondary/50 border border-border px-3 py-2"
-              value={contextLen}
-              onChange={(e) => setContextLen(Number(e.target.value))}
-              disabled={isRunning}
-            />
-          </label>
-          <label className="text-sm">
-            <span className="text-muted-foreground">训练截止日</span>
-            <input
-              className="mt-1 w-full rounded-lg bg-secondary/50 border border-border px-3 py-2"
-              value={asOfMonth}
-              onChange={(e) => setAsOfMonth(e.target.value)}
-              disabled={isRunning}
-            />
-          </label>
-          <label className="text-sm">
-            <span className="text-muted-foreground">测试起始日</span>
-            <input
-              className="mt-1 w-full rounded-lg bg-secondary/50 border border-border px-3 py-2"
-              value={testStart}
-              onChange={(e) => setTestStart(e.target.value)}
-              disabled={isRunning}
-            />
-          </label>
-          <label className="text-sm">
-            <span className="text-muted-foreground">测试结束日</span>
-            <input
-              className="mt-1 w-full rounded-lg bg-secondary/50 border border-border px-3 py-2"
-              value={testEnd}
-              onChange={(e) => setTestEnd(e.target.value)}
-              disabled={isRunning}
-            />
-          </label>
-        </CardContent>
-      </Card>
+        )}
 
-      <div className="flex gap-3">
-        {!isRunning ? (
-          <Button onClick={handleStart} disabled={isStarting || backendAvailable === false}>
-            {isStarting ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : <Play className="h-4 w-4 mr-2" />}
-            开始预测
-          </Button>
-        ) : (
-          <Button variant="destructive" onClick={stopForecastTask}>
-            <Square className="h-4 w-4 mr-2" />
-            取消
-          </Button>
+        {taskQuery && <UserBubble text={taskQuery} />}
+
+        {forecastAgentMessages.map((msg, i) =>
+          msg.role === 'user' ? (
+            <UserBubble key={`${msg.timestamp}-u-${i}`} text={msg.text} />
+          ) : (
+            <AssistantBlock key={`${msg.timestamp}-a-${i}`} msg={msg} renderPayload={renderPayload} />
+          ),
         )}
-        {task?.status && (
-          <Badge variant={task.status === 'completed' ? 'default' : 'outline'}>{task.status}</Badge>
+
+        {followUpMessages.map((msg, i) =>
+          msg.role === 'user' ? (
+            <UserBubble key={`follow-${msg.timestamp}-u-${i}`} text={msg.text} />
+          ) : (
+            <AssistantBlock key={`follow-${msg.timestamp}-a-${i}`} msg={msg} renderPayload={renderPayload} />
+          ),
         )}
-        {(metrics.display_model || metrics.best_model) && (
-          <Badge variant="outline">
-            展示: {metrics.display_model || metrics.best_model}
-          </Badge>
-        )}
-        {Array.isArray(metrics.feature_cols_used) && metrics.feature_cols_used.length > 0 && (
-          <Badge variant="outline" title={metrics.feature_cols_used.join(', ')}>
-            特征 {metrics.feature_cols_used.length} 列
-          </Badge>
-        )}
+
+        {(running && !awaitingCheckpoint) || (submitting && canAskQa) ? <TypingIndicator /> : null}
+
+        <div ref={chatEndRef} />
       </div>
 
-      {(testMetrics.MAPE != null || testMetrics.RMSE != null) && (
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-          <Card className="glass p-4 text-center">
-            <div className="text-xs text-muted-foreground">MAPE</div>
-            <div className="text-lg font-bold">{formatNumber(testMetrics.MAPE, 2)}%</div>
-          </Card>
-          <Card className="glass p-4 text-center">
-            <div className="text-xs text-muted-foreground">RMSE</div>
-            <div className="text-lg font-bold">{formatNumber(testMetrics.RMSE, 0)}</div>
-          </Card>
-          <Card className="glass p-4 text-center">
-            <div className="text-xs text-muted-foreground">MAE</div>
-            <div className="text-lg font-bold">{formatNumber(testMetrics.MAE, 0)}</div>
-          </Card>
-          <Card className="glass p-4 text-center">
-            <div className="text-xs text-muted-foreground">R²</div>
-            <div className="text-lg font-bold">{formatNumber(testMetrics.R2, 4)}</div>
-          </Card>
+      {/* QA quick replies after forecast completes */}
+      {canAskQa && !submitting && (
+        <div className="shrink-0 flex flex-wrap gap-2 pb-2">
+          {QA_EXAMPLE_PROMPTS.map((q) => (
+            <button
+              key={q}
+              type="button"
+              disabled={submitting}
+              onClick={() => setInput(q)}
+              className="text-xs px-3 py-1.5 rounded-full border border-primary/30 bg-primary/10 hover:bg-primary/20 text-foreground transition-colors disabled:opacity-50"
+            >
+              {q}
+            </button>
+          ))}
         </div>
       )}
 
-      {curve.length > 0 && (
-        <Card className="glass">
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <TrendingUp className="h-5 w-5" />
-              预测 vs 真实
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <p className="text-xs text-muted-foreground mb-3">
-              橙色为模型预测（含 bridge 与 test）；蓝色为测试区间真实销量（有实测值的旬）。
-              {!hasActual && ' 当前结果中暂无真实值，请重新跑预测后刷新。'}
-            </p>
-            <div className="h-[300px]">
-              <ResponsiveContainer width="100%" height="100%">
-                <LineChart
-                  data={curve}
-                  margin={{ top: 8, right: 16, left: 8, bottom: 28 }}
-                >
-                  <CartesianGrid strokeDasharray="3 3" opacity={0.2} />
-                  <XAxis
-                    dataKey="ds"
-                    tick={{ fontSize: 10 }}
-                    interval={0}
-                    minTickGap={0}
-                    angle={-28}
-                    textAnchor="end"
-                    height={56}
-                    tickFormatter={(v: string) => (v && v.length >= 10 ? v.slice(5) : v)}
-                  />
-                  <YAxis tick={{ fontSize: 10 }} />
-                  <Tooltip
-                    formatter={(value: number, name: string) => [
-                      formatNumber(value, 0),
-                      name === 'yhat' ? '预测' : '真实',
-                    ]}
-                  />
-                  <Legend
-                    formatter={(value) => (value === 'yhat' ? '预测' : '真实')}
-                  />
-                  <Line
-                    type="monotone"
-                    dataKey="yhat"
-                    name="yhat"
-                    stroke="#f97316"
-                    strokeWidth={2}
-                    dot={false}
-                  />
-                  {hasActual && (
-                    <Line
-                      type="monotone"
-                      dataKey="y"
-                      name="y"
-                      stroke="#3b82f6"
-                      strokeWidth={2}
-                      dot={{ r: 3 }}
-                      connectNulls={false}
-                    />
-                  )}
-                </LineChart>
-              </ResponsiveContainer>
-            </div>
-          </CardContent>
-        </Card>
+      {/* Quick replies */}
+      {canReply && quickReplies.length > 0 && (
+        <div className="shrink-0 flex flex-wrap gap-2 pb-2">
+          {quickReplies.map((q) => (
+            <button
+              key={q}
+              type="button"
+              disabled={submitting}
+              onClick={() => {
+                setInput(q);
+                void (async () => {
+                  setSubmitting(true);
+                  try {
+                    await continueForecastAgentTask({
+                      checkpoint: awaitingCheckpoint,
+                      message: q,
+                    });
+                    setInput('');
+                  } finally {
+                    setSubmitting(false);
+                  }
+                })();
+              }}
+              className="text-xs px-3 py-1.5 rounded-full border border-primary/30 bg-primary/10 hover:bg-primary/20 text-foreground transition-colors disabled:opacity-50"
+            >
+              {q}
+            </button>
+          ))}
+        </div>
       )}
 
-      <Card className="glass">
-        <CardHeader>
-          <CardTitle>LLM 结果问答</CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          <p className="text-xs text-muted-foreground">
-            基于当前模型结果表（真实值/预测值）和特征列回答问题。
-          </p>
-          <textarea
-            className="w-full min-h-[84px] rounded-lg bg-secondary/50 border border-border px-3 py-2 text-sm"
-            placeholder="例如：为什么 2025-12 到 2026-01 的误差更大？"
-            value={qaQuery}
-            onChange={(e) => setQaQuery(e.target.value)}
-            disabled={qaLoading}
-          />
-          <div className="flex items-center gap-3">
-            <Button onClick={handleAskQa} disabled={qaLoading || !qaQuery.trim()}>
-              {qaLoading ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
-              发送提问
-            </Button>
-            <span className="text-xs text-muted-foreground">
-              结果模型: {qaModel || '-'} | 输出目录: {qaOutputDir}
-            </span>
-          </div>
-          {qaError && <div className="text-sm text-red-400">{qaError}</div>}
-          {qaAnswer && (
-            <div className="rounded-lg border border-border bg-secondary/30 p-3 space-y-2">
-              {qaMeta && (
-                <div className="text-xs text-muted-foreground">
-                  LLM: {qaMeta.modelUsed || '-'} | rows: {qaMeta.rowsUsed} | mode: {qaMeta.dataMode}
-                </div>
+      {/* Composer */}
+      <div className="shrink-0 pt-2 border-t border-border/40">
+        <div className="glass rounded-xl border border-border/50 p-3">
+          <div className="flex items-end gap-2">
+            <button
+              type="button"
+              onClick={() => setShowSettings((v) => !v)}
+              className={`shrink-0 p-2 rounded-lg transition-colors ${
+                showSettings ? 'bg-secondary text-foreground' : 'text-muted-foreground hover:bg-secondary/50'
+              }`}
+              title="高级设置"
+            >
+              <Settings2 className="h-4 w-4" />
+            </button>
+            <textarea
+              ref={textareaRef}
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={handleKeyDown}
+              placeholder={placeholder}
+              disabled={isBusy && !canReply}
+              rows={1}
+              className="flex-1 bg-transparent text-sm placeholder:text-muted-foreground focus:outline-none resize-none leading-relaxed min-h-[40px] max-h-[140px] py-2"
+            />
+            <div className="flex shrink-0 items-center gap-2">
+              {canReply && (
+                <button
+                  type="button"
+                  onClick={() => void handleSend()}
+                  disabled={submitting || backendAvailable === false}
+                  className="p-2.5 rounded-lg bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-40 transition-colors"
+                  title="发送 (Enter)"
+                >
+                  {submitting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
+                </button>
               )}
-              <div>{renderMarkdownLike(qaAnswer)}</div>
+              {running ? (
+                <button
+                  type="button"
+                  onClick={stopForecastAgentTask}
+                  className="p-2.5 rounded-lg bg-destructive text-destructive-foreground hover:bg-destructive/90 transition-colors"
+                  title="取消任务"
+                >
+                  <Square className="h-4 w-4" />
+                </button>
+              ) : (
+                !canReply && (
+                  <button
+                    type="button"
+                    onClick={() => void handleSend()}
+                    disabled={!input.trim() || submitting || backendAvailable === false}
+                    className="p-2.5 rounded-lg bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-40 transition-colors"
+                    title="发送 (Enter)"
+                  >
+                    {submitting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
+                  </button>
+                )
+              )}
+            </div>
+          </div>
+
+          {showSettings && (
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 mt-3 pt-3 border-t border-border/40">
+              <input
+                className="rounded-lg bg-secondary/50 border border-border px-3 py-1.5 text-xs"
+                placeholder="省份"
+                value={province}
+                onChange={(e) => setProvince(e.target.value)}
+                disabled={running}
+              />
+              <input
+                type="number"
+                className="rounded-lg bg-secondary/50 border border-border px-3 py-1.5 text-xs"
+                placeholder="context_len"
+                value={contextLen}
+                onChange={(e) => setContextLen(Number(e.target.value))}
+                disabled={running}
+              />
+              <input
+                className="rounded-lg bg-secondary/50 border border-border px-3 py-1.5 text-xs"
+                placeholder="可选：结束后自动问答"
+                value={qaQuery}
+                onChange={(e) => setQaQuery(e.target.value)}
+                disabled={running}
+              />
             </div>
           )}
-        </CardContent>
-      </Card>
+        </div>
 
-      <Card className="glass">
-        <CardHeader>
-          <CardTitle>运行日志</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="h-64 overflow-y-auto font-mono text-xs bg-black/30 rounded-lg p-3 space-y-1">
-            {logs.length === 0 && <p className="text-muted-foreground">暂无日志</p>}
-            {logs.map((log) => (
+        <button
+          type="button"
+          onClick={() => setShowLogs((v) => !v)}
+          className="mt-2 flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
+        >
+          {showLogs ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
+          运行日志 {forecastAgentLogs.length > 0 ? `(${forecastAgentLogs.length})` : ''}
+        </button>
+
+        {showLogs && (
+          <div className="mt-2 max-h-36 overflow-y-auto font-mono text-[11px] bg-black/30 rounded-lg p-2 space-y-0.5 border border-border/40">
+            {forecastAgentLogs.length === 0 && <p className="text-muted-foreground">暂无日志</p>}
+            {forecastAgentLogs.map((log) => (
               <div
                 key={log.id}
                 className={
@@ -615,16 +728,15 @@ export const ForecastPage: React.FC = () => {
                     ? 'text-red-400'
                     : log.level === 'success'
                       ? 'text-green-400'
-                      : 'text-foreground/80'
+                      : 'text-foreground/70'
                 }
               >
                 [{log.timestamp}] {log.message}
               </div>
             ))}
-            <div ref={logsEndRef} />
           </div>
-        </CardContent>
-      </Card>
+        )}
+      </div>
     </div>
   );
 };

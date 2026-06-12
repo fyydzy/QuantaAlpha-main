@@ -10,6 +10,7 @@ import asyncio
 import glob
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -70,46 +71,6 @@ class BacktestStartRequest(BaseModel):
     configPath: Optional[str] = Field(None, description="Path to backtest config")
 
 
-class ForecastStartRequest(BaseModel):
-    """Request to start gas sales decadal forecast."""
-    model: str = Field("auto", description="auto | lasso | lstm | ...")
-    province: Optional[str] = Field("河北", description="Province name for Excel lookup")
-    excel: Optional[str] = Field(None, description="Explicit Excel path")
-    asOfMonth: Optional[str] = Field(None, description="Training cutoff date YYYY-MM-DD")
-    testStart: Optional[str] = Field(None, description="Test start date YYYY-MM-DD")
-    testEnd: Optional[str] = Field(None, description="Test end date YYYY-MM-DD")
-    outputDir: Optional[str] = Field(None, description="Output root directory")
-    contextLen: Optional[int] = Field(270, description="History window in decadal periods")
-    candidateModels: Optional[str] = Field(
-        None,
-        description="Comma-separated models when model=auto",
-    )
-    configPath: Optional[str] = Field(None, description="Path to forecast.yaml")
-    selectionMetric: Optional[str] = Field("mape", description="mape | score")
-    timesfmDevice: Optional[str] = Field("cpu", description="cpu | gpu for timesfm")
-    modelFeatures: Optional[Dict[str, List[str]]] = Field(
-        None,
-        description="Optional per-model feature overrides, e.g. {'lasso': ['HDD','Lag_36']}",
-    )
-
-
-class ForecastSearchStartRequest(BaseModel):
-    """Request to start forecast feature-set search (LLM)."""
-    goal: str = Field(..., description="Natural language goal for feature-set planning")
-    province: Optional[str] = Field("河北", description="Province name for Excel lookup")
-    asOfMonth: Optional[str] = Field(None, description="Training cutoff date YYYY-MM-DD")
-    testStart: Optional[str] = Field(None, description="Test start date YYYY-MM-DD")
-    testEnd: Optional[str] = Field(None, description="Test end date YYYY-MM-DD")
-    outputDir: Optional[str] = Field(None, description="Output root directory")
-    contextLen: Optional[int] = Field(270, description="History window in decadal periods")
-    model: Optional[str] = Field("xgboost", description="Fixed backend for comparing feature sets")
-    numberOfSolutions: Optional[int] = Field(4, description="How many solutions LLM proposes")
-    maxFeatureCount: Optional[int] = Field(10, description="Max features per solution")
-    requiredFeatures: Optional[List[str]] = Field(None, description="Required features for every solution")
-    configPath: Optional[str] = Field(None, description="Path to forecast_search.yaml")
-    onlyFeedback: Optional[bool] = Field(False, description="If true, only generate feedback from existing outputs")
-
-
 class ForecastQaRequest(BaseModel):
     """Request to ask LLM about forecast result table."""
     outputDir: str = Field(..., description="Forecast output root directory")
@@ -119,6 +80,27 @@ class ForecastQaRequest(BaseModel):
         None,
         description="Frontend selected features for current model",
     )
+
+
+class ForecastAgentStartRequest(BaseModel):
+    """Request to start single-round forecast agent flow."""
+    query: str = Field(..., description="Natural language request")
+    province: Optional[str] = Field("河北", description="Province name")
+    candidateModels: Optional[str] = Field(None, description="Comma-separated candidate models")
+    outputDir: Optional[str] = Field(None, description="Output directory")
+    contextLen: Optional[int] = Field(270, description="Context length")
+    maxFeatureCount: Optional[int] = Field(10, description="Max recommended features")
+    importanceTopK: Optional[int] = Field(12, description="Top-K feature importance for prompting")
+    requiredFeatures: Optional[List[str]] = Field(None, description="Required features in recommendation")
+    qaQuery: Optional[str] = Field(None, description="Optional QA query after forecast")
+
+
+class ForecastAgentContinueRequest(BaseModel):
+    """Request to continue a paused forecast agent checkpoint."""
+    checkpoint: Optional[str] = Field(None, description="Expected waiting checkpoint")
+    approved: bool = Field(True, description="Whether user approves to continue")
+    overrides: Optional[Dict[str, Any]] = Field(None, description="Optional override payload")
+    message: Optional[str] = Field(None, description="Optional user message")
 
 
 class SystemConfigUpdate(BaseModel):
@@ -142,6 +124,9 @@ class ApiResponse(BaseModel):
 
 tasks: Dict[str, Dict[str, Any]] = {}
 ws_connections: Dict[str, List[WebSocket]] = {}  # task_id -> list of WS
+# 燃气预测智能体：人机确认暂停/续跑句柄（必须放模块级，不能放进 tasks[task_id]，否则 GET 任务 JSON 序列化失败）
+_forecast_continue_events: Dict[str, asyncio.Event] = {}
+_forecast_continue_payloads: Dict[str, Dict[str, Any]] = {}
 
 
 # ========================== Utility Helpers ==========================
@@ -152,6 +137,11 @@ def _gen_id() -> str:
 
 def _now() -> str:
     return datetime.now().isoformat()
+
+
+def _task_for_api(task: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a JSON-serializable copy of task state (strip runtime-only fields)."""
+    return {k: v for k, v in task.items() if not str(k).startswith("_")}
 
 def _decode_subprocess_line(line_bytes: bytes) -> str:
     """Best-effort decode for Windows consoles and UTF-8 Python output."""
@@ -1164,7 +1154,7 @@ def _resolve_weather_file(filename: str) -> Path:
     return path
 
 
-def _parse_bj_datetime(series: "pd.Series") -> "pd.Series":
+def _parse_bj_datetime(series: Any) -> Any:
     import pandas as pd
 
     return pd.to_datetime(series, errors="coerce")
@@ -1345,72 +1335,6 @@ async def weather_daily_data(file: str = Query(..., description="hebei_ecmwf_s5_
     )
 
 
-# ---- Forecast endpoints ----
-
-@app.post("/api/v1/forecast/start", response_model=ApiResponse)
-async def start_forecast(req: ForecastStartRequest):
-    """Start gas sales decadal forecast."""
-    task_id = _gen_id()
-    config_path = req.configPath or str(PROJECT_ROOT / "configs" / "forecast.yaml")
-    output_dir = req.outputDir or f"forecast_agent_output/{req.province or '河北'}"
-
-    task = {
-        "taskId": task_id,
-        "status": "running",
-        "type": "forecast",
-        "config": {**req.model_dump(), "configPath": config_path, "outputDir": output_dir},
-        "progress": {
-            "phase": "forecasting",
-            "currentRound": 0,
-            "totalRounds": 1,
-            "progress": 0,
-            "message": "正在启动燃气预测...",
-            "timestamp": _now(),
-        },
-        "logs": [],
-        "metrics": {},
-        "result": None,
-        "pid": None,
-        "createdAt": _now(),
-        "updatedAt": _now(),
-    }
-    tasks[task_id] = task
-    asyncio.create_task(_run_forecast(task_id, req, config_path, output_dir))
-    return ApiResponse(
-        success=True,
-        data={"taskId": task_id, "task": task},
-        message="燃气预测已启动",
-    )
-
-
-@app.get("/api/v1/forecast/{task_id}", response_model=ApiResponse)
-async def get_forecast_status(task_id: str):
-    if task_id not in tasks:
-        raise HTTPException(status_code=404, detail="Task not found")
-    return ApiResponse(success=True, data={"task": tasks[task_id]})
-
-
-@app.delete("/api/v1/forecast/{task_id}", response_model=ApiResponse)
-async def cancel_forecast(task_id: str):
-    if task_id not in tasks:
-        raise HTTPException(status_code=404, detail="Task not found")
-    task = tasks[task_id]
-    if task.get("pid"):
-        try:
-            os.kill(task["pid"], signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-    task["status"] = "cancelled"
-    task["updatedAt"] = _now()
-    await _broadcast(task_id, {
-        "type": "result",
-        "taskId": task_id,
-        "data": {"status": "cancelled"},
-        "timestamp": _now(),
-    })
-    return ApiResponse(success=True, message="燃气预测已取消")
-
-
 def _load_feature_cols_used_for_model(out_root: Path, model: str) -> list[str]:
     summary = out_root / model / f"{model}_best_summary.json"
     if not summary.exists():
@@ -1476,26 +1400,314 @@ async def ask_forecast_qa(req: ForecastQaRequest):
         raise HTTPException(status_code=500, detail=f"LLM 问答失败: {exc}") from exc
 
 
-# ---- Forecast Search endpoints ----
+async def _run_forecast_agent(
+    task_id: str,
+    req: ForecastAgentStartRequest,
+    output_dir: str,
+):
+    """燃气预测智能体主协程（Web 专用）。
 
-@app.post("/api/v1/forecast_search/start", response_model=ApiResponse)
-async def start_forecast_search(req: ForecastSearchStartRequest):
-    """Start LLM feature-set solution search for gas sales forecast."""
+    职责：驱动 gas_forecast_flow 各阶段、推送聊天消息、在两个人机确认点挂起等待。
+    业务规则（意图/覆写/LLM prompt）在 gas_forecast_flow.py，本函数只做任务状态与 WS 广播。
+
+    阅读顺序：_emit_stage → _wait_for_continue → 下方「阶段 0~5」顺序块 → continue_forecast_agent。
+    """
+    task = tasks[task_id]
+    try:
+        # Ensure .env credentials are visible in current process
+        # (agent flow runs in-process, unlike subprocess-based tasks).
+        os.environ.update(_load_dotenv_dict())
+
+        from quantaalpha.forecast_agent.gas_forecast_flow import (
+            FIXED_AS_OF_DATE,
+            apply_intent_overrides,
+            ask_flow_qa,
+            diagnose_importance,
+            normalize_continue_overrides,
+            parse_intent,
+            recommend_feature_superset,
+            run_compare_and_rollup,
+        )
+
+        if not str(os.getenv("OPENAI_API_KEY", "")).strip():
+            raise RuntimeError("缺少 OPENAI_API_KEY，请在项目根目录 .env 中配置后重试")
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_root = Path(output_dir or f"forecast_agent_output/{req.province or '河北'}/agent_flow_{ts}")
+        if not out_root.is_absolute():
+            out_root = PROJECT_ROOT / out_root
+        out_root.mkdir(parents=True, exist_ok=True)
+
+        def _set_progress(phase: str, progress: int, message: str) -> dict[str, Any]:
+            task["progress"]["phase"] = phase
+            task["progress"]["progress"] = progress
+            task["progress"]["message"] = message
+            task["progress"]["timestamp"] = _now()
+            return dict(task["progress"])
+
+        async def _emit_stage(stage: str, text: str, payload: Dict[str, Any], *, need_confirm: bool = False):
+            # 往聊天流追加一条助手消息，经 WS type=metrics 推给前端（ForecastPage / TaskContext）
+            agent_message = {
+                "role": "assistant",
+                "stage": stage,
+                "messageType": f"{stage}_card",
+                "text": text,
+                "payload": payload,
+                "needConfirm": need_confirm,
+                "timestamp": _now(),
+            }
+            if not isinstance(task.get("metrics"), dict):
+                task["metrics"] = {}
+            msg_list = task["metrics"].get("agent_messages")
+            if not isinstance(msg_list, list):
+                msg_list = []
+            msg_list.append(agent_message)
+            task["metrics"]["agent_messages"] = msg_list[-200:]
+            task["metrics"]["agent_message"] = agent_message
+            await _broadcast(
+                task_id,
+                {
+                    "type": "metrics",
+                    "taskId": task_id,
+                    "data": {
+                        "agent_stage": stage,
+                        "agent_message": agent_message,
+                    },
+                    "timestamp": _now(),
+                },
+            )
+
+        async def _wait_for_continue(checkpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+            # 人机确认：挂起本协程，直到用户 POST .../continue 写入 payload 并 event.set()
+            # checkpoint: confirm_intent | confirm_features
+            event = asyncio.Event()
+            _forecast_continue_events[task_id] = event
+            _forecast_continue_payloads.pop(task_id, None)
+            if not isinstance(task.get("metrics"), dict):
+                task["metrics"] = {}
+            task["metrics"]["awaiting_confirmation"] = {
+                "checkpoint": checkpoint,
+                "timestamp": _now(),
+                "payload": payload,
+            }
+            await _broadcast(
+                task_id,
+                {
+                    "type": "metrics",
+                    "taskId": task_id,
+                    "data": {
+                        "awaiting_confirmation": task["metrics"]["awaiting_confirmation"],
+                    },
+                    "timestamp": _now(),
+                },
+            )
+            confirm_text = (
+                "以上是我理解的预测参数。若无问题请直接回复「继续」；也可说明要改的省份或目标月份。"
+                if checkpoint == "confirm_intent"
+                else "以上是我推荐的特征组合。若同意请回复「继续」；也可直接说想增删哪些特征。"
+            )
+            await _emit_stage(
+                checkpoint,
+                confirm_text,
+                payload,
+                need_confirm=True,
+            )
+            await event.wait()
+            cont = _forecast_continue_payloads.pop(task_id, None)
+            _forecast_continue_events.pop(task_id, None)
+            task["metrics"]["awaiting_confirmation"] = None
+            await _broadcast(
+                task_id,
+                {
+                    "type": "metrics",
+                    "taskId": task_id,
+                    "data": {"awaiting_confirmation": None},
+                    "timestamp": _now(),
+                },
+            )
+            return cont if isinstance(cont, dict) else {}
+
+        # --- 阶段 0：意图解析 + 确认点①（参数）---
+        await _broadcast(task_id, {"type": "progress", "taskId": task_id, "data": _set_progress("parsing", 10, "解析用户意图..."), "timestamp": _now()})
+        intent = await asyncio.to_thread(
+            parse_intent,
+            req.query,
+            default_province=str(req.province or "河北"),
+            as_of_month=FIXED_AS_OF_DATE,
+        )
+        await _emit_stage("parse_intent", "我已根据你的描述解析出以下预测参数：", intent)
+        cont_intent = await _wait_for_continue("confirm_intent", {"intent": intent})
+        if cont_intent.get("approved") is False:
+            raise RuntimeError("用户在参数确认阶段取消了任务")
+        intent_overrides = normalize_continue_overrides(
+            "confirm_intent",
+            cont_intent.get("overrides") if isinstance(cont_intent.get("overrides"), dict) else {},
+        )
+        if intent_overrides:
+            intent = apply_intent_overrides(intent, intent_overrides)
+            await _emit_stage("intent_applied", "好的，我已按你的要求更新了预测参数：", intent)
+
+        # --- 阶段 1：xgboost 全特征诊断（与用户最终特征无关，只产出 importance）---
+        await _broadcast(task_id, {"type": "progress", "taskId": task_id, "data": _set_progress("analyzing", 30, "运行 xgboost 诊断并提取重要性..."), "timestamp": _now()})
+        diagnose = await asyncio.to_thread(
+            diagnose_importance,
+            intent,
+            output_dir=out_root,
+            context_len=int(req.contextLen or 270),
+        )
+        await _emit_stage(
+            "diagnose",
+            "我已完成 xgboost 特征重要性诊断，以下是 Top 特征：",
+            {
+                "topFeatures": diagnose.get("importance_items", [])[: int(req.importanceTopK or 12)],
+                "testMetrics": diagnose.get("test_metrics", {}),
+            },
+        )
+
+        # --- 阶段 2：LLM 特征推荐 + 确认点②（特征）---
+        await _broadcast(task_id, {"type": "progress", "taskId": task_id, "data": _set_progress("planning", 50, "LLM 推荐特征组合..."), "timestamp": _now()})
+        recommend = await asyncio.to_thread(
+            recommend_feature_superset,
+            query=req.query,
+            intent=intent,
+            importance_items=diagnose.get("importance_items", []),
+            max_feature_count=int(req.maxFeatureCount or 10),
+            top_k=int(req.importanceTopK or 12),
+            required_features=list(req.requiredFeatures or []),
+        )
+        await _emit_stage(
+            "recommend",
+            "结合重要性证据，我为你推荐了以下特征组合：",
+            {
+                "featureSuperset": recommend.get("feature_superset", []),
+                "reason": recommend.get("reason", ""),
+            },
+        )
+        cont_features = await _wait_for_continue(
+            "confirm_features",
+            {
+                "featureSuperset": recommend.get("feature_superset", []),
+                "reason": recommend.get("reason", ""),
+            },
+        )
+        if cont_features.get("approved") is False:
+            raise RuntimeError("用户在特征确认阶段取消了任务")
+        feature_overrides = normalize_continue_overrides(
+            "confirm_features",
+            cont_features.get("overrides") if isinstance(cont_features.get("overrides"), dict) else {},
+        )
+        fs = feature_overrides.get("featureSuperset")
+        if isinstance(fs, list) and fs:
+            recommend["feature_superset"] = fs
+            await _emit_stage(
+                "features_applied",
+                "好的，我已按你的要求更新了特征组合：",
+                {
+                    "featureSuperset": recommend["feature_superset"],
+                    "reason": recommend.get("reason", ""),
+                },
+            )
+
+        # --- 阶段 3：多模型比选 + 月度汇总（无第三个人机确认点）---
+        await _broadcast(task_id, {"type": "progress", "taskId": task_id, "data": _set_progress("forecasting", 75, "执行多模型比选与预测..."), "timestamp": _now()})
+        compare = await asyncio.to_thread(
+            run_compare_and_rollup,
+            intent=intent,
+            feature_superset=list(recommend.get("feature_superset") or []),
+            output_dir=out_root,
+            context_len=int(req.contextLen or 270),
+            candidate_models=(req.candidateModels or ""),
+        )
+        await _emit_stage(
+            "compare",
+            "多模型比选已完成，结果如下：",
+            {
+                "bestModel": compare.get("best_model"),
+                "leaderboard": compare.get("leaderboard", []),
+                "monthlyRollup": compare.get("monthly_rollup", []),
+            },
+        )
+        selected_model = str(compare.get("best_model") or "")
+
+        payload: Dict[str, Any] = {
+            "query": req.query,
+            "intent": intent,
+            "diagnose": {
+                "summary_json": diagnose.get("summary_json"),
+                "feature_importance_top": diagnose.get("importance_items", [])[: int(req.importanceTopK or 12)],
+                "test_metrics": diagnose.get("test_metrics", {}),
+            },
+            "recommend": {
+                "feature_superset": recommend.get("feature_superset", []),
+                "reason": recommend.get("reason", ""),
+            },
+            "compare": compare,
+            "selected_model": selected_model,
+            "output_dir": str(out_root),
+        }
+
+        # --- 阶段 4（可选）：启动时预填 qaQuery 则自动问答一次；完成后多轮追问走 POST /forecast/qa ---
+        if req.qaQuery and str(req.qaQuery).strip() and selected_model:
+            await _broadcast(task_id, {"type": "progress", "taskId": task_id, "data": _set_progress("qa", 90, "生成问答结果..."), "timestamp": _now()})
+            qa = await asyncio.to_thread(
+                ask_flow_qa,
+                output_dir=out_root,
+                model=selected_model,
+                query=str(req.qaQuery),
+                selected_features=list(recommend.get("feature_superset") or []),
+            )
+            payload["qa"] = qa
+            await _emit_stage("qa", "已完成结果问答。", qa)
+
+        result_json = out_root / "agent_flow_result.json"
+        result_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        task["metrics"] = payload
+        task["status"] = "completed"
+        task["updatedAt"] = _now()
+        await _broadcast(task_id, {"type": "progress", "taskId": task_id, "data": _set_progress("completed", 100, "预测智能体流程完成"), "timestamp": _now()})
+        await _broadcast(
+            task_id,
+            {
+                "type": "result",
+                "taskId": task_id,
+                "data": {"status": "completed", "metrics": payload},
+                "timestamp": _now(),
+            },
+        )
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        task["status"] = "failed"
+        task["progress"]["message"] = str(e)
+        task["updatedAt"] = _now()
+        await _broadcast(
+            task_id,
+            {
+                "type": "error",
+                "taskId": task_id,
+                "data": {"error": str(e)},
+                "timestamp": _now(),
+            },
+        )
+
+
+@app.post("/api/v1/forecast/agent/start", response_model=ApiResponse)
+async def start_forecast_agent(req: ForecastAgentStartRequest):
+    """Start single-round forecast agent flow task."""
     task_id = _gen_id()
-    config_path = req.configPath or str(PROJECT_ROOT / "configs" / "forecast_search.yaml")
     output_dir = req.outputDir or f"forecast_agent_output/{req.province or '河北'}"
-
     task = {
         "taskId": task_id,
         "status": "running",
-        "type": "forecast_search",
-        "config": {**req.model_dump(), "configPath": config_path, "outputDir": output_dir},
+        "type": "forecast_agent",
+        "config": {**req.model_dump(), "outputDir": output_dir},
         "progress": {
-            "phase": "planning",
+            "phase": "parsing",
             "currentRound": 0,
             "totalRounds": 1,
             "progress": 0,
-            "message": "正在启动特征方案搜索...",
+            "message": "正在启动预测智能体...",
             "timestamp": _now(),
         },
         "logs": [],
@@ -1506,406 +1718,129 @@ async def start_forecast_search(req: ForecastSearchStartRequest):
         "updatedAt": _now(),
     }
     tasks[task_id] = task
-    asyncio.create_task(_run_forecast_search(task_id, req, config_path, output_dir))
+    asyncio.create_task(_run_forecast_agent(task_id, req, output_dir))
     return ApiResponse(
         success=True,
-        data={"taskId": task_id, "task": task},
-        message="特征方案搜索已启动",
+        data={"taskId": task_id, "task": _task_for_api(task)},
+        message="预测智能体已启动",
     )
 
 
-@app.get("/api/v1/forecast_search/{task_id}", response_model=ApiResponse)
-async def get_forecast_search_status(task_id: str):
+@app.get("/api/v1/forecast/agent/{task_id}", response_model=ApiResponse)
+async def get_forecast_agent_status(task_id: str):
     if task_id not in tasks:
         raise HTTPException(status_code=404, detail="Task not found")
-    return ApiResponse(success=True, data={"task": tasks[task_id]})
+    return ApiResponse(success=True, data={"task": _task_for_api(tasks[task_id])})
 
 
-@app.delete("/api/v1/forecast_search/{task_id}", response_model=ApiResponse)
-async def cancel_forecast_search(task_id: str):
+@app.delete("/api/v1/forecast/agent/{task_id}", response_model=ApiResponse)
+async def cancel_forecast_agent(task_id: str):
     if task_id not in tasks:
         raise HTTPException(status_code=404, detail="Task not found")
     task = tasks[task_id]
-    if task.get("pid"):
-        try:
-            os.kill(task["pid"], signal.SIGTERM)
-        except ProcessLookupError:
-            pass
     task["status"] = "cancelled"
     task["updatedAt"] = _now()
+    _forecast_continue_payloads.pop(task_id, None)
+    cont_event = _forecast_continue_events.pop(task_id, None)
+    if isinstance(cont_event, asyncio.Event):
+        cont_event.set()
     await _broadcast(task_id, {
         "type": "result",
         "taskId": task_id,
         "data": {"status": "cancelled"},
         "timestamp": _now(),
     })
-    return ApiResponse(success=True, message="特征方案搜索已取消")
+    return ApiResponse(success=True, message="预测智能体任务已取消")
 
 
-async def _run_forecast_search(
-    task_id: str,
-    req: ForecastSearchStartRequest,
-    config_path: str,
-    output_dir: str,
-):
+@app.post("/api/v1/forecast/agent/{task_id}/continue", response_model=ApiResponse)
+async def continue_forecast_agent(task_id: str, req: ForecastAgentContinueRequest):
+    """用户在人机确认点的回复入口。
+
+    调用 gas_forecast_flow.parse_continue_message（仅 LLM 解析 approved/overrides），
+    写入 _forecast_continue_payloads 并唤醒 _wait_for_continue 中阻塞的协程。
+    """
+    if task_id not in tasks:
+        raise HTTPException(status_code=404, detail="Task not found")
     task = tasks[task_id]
-    try:
-        env = os.environ.copy()
-        env.update(_load_dotenv_dict())
-        # Force child Python output to UTF-8 to reduce mojibake on Windows.
-        env.setdefault("PYTHONIOENCODING", "utf-8")
-        env.setdefault("PYTHONUTF8", "1")
-
-        dotenv = _load_dotenv_dict()
-        conda_env = dotenv.get("CONDA_ENV_NAME", "quantaalpha")
-        python_bin = sys.executable
-        for prefix in [
-            os.path.expanduser(f"~/.conda/envs/{conda_env}"),
-        ]:
-            candidate = os.path.join(prefix, "bin", "python")
-            if os.path.isfile(candidate):
-                python_bin = candidate
-                break
-            candidate_win = os.path.join(prefix, "python.exe")
-            if os.path.isfile(candidate_win):
-                python_bin = candidate_win
-                break
-
-        # Call forecast_search_from_fire directly to allow overriding goal/province/etc.
-        # We use -c for portability and to keep logs streaming to stdout.
-        import json as _json
-
-        if req.onlyFeedback:
-            task["progress"]["phase"] = "feedback"
-            task["progress"]["message"] = "只生成总结（不重新跑方案）..."
-            task["progress"]["timestamp"] = _now()
-            await _broadcast(task_id, {"type": "progress", "taskId": task_id, "data": task["progress"], "timestamp": _now()})
-
-            payload = {
-                "output_dir": output_dir,
-                "goal": req.goal,
-            }
-            code = (
-                "import json\n"
-                "from quantaalpha.forecast_agent.forecast_feedback import FeedbackConfig, generate_forecast_search_feedback\n"
-                f"cfg = FeedbackConfig(**json.loads({ _json.dumps(_json.dumps(payload, ensure_ascii=False)) }))\n"
-                "generate_forecast_search_feedback(cfg)\n"
-            )
-        else:
-            payload = {
-                "config": config_path,
-                "goal": req.goal,
-                "province": req.province,
-                "as_of_month": req.asOfMonth,
-                "test_start": req.testStart,
-                "test_end": req.testEnd,
-                "output_dir": output_dir,
-                "context_len": req.contextLen,
-                "model": req.model,
-                "number_of_solutions": req.numberOfSolutions,
-                "max_feature_count": req.maxFeatureCount,
-                "required_features": req.requiredFeatures,
-            }
-            payload = {k: v for k, v in payload.items() if v is not None}
-            code = (
-                "import json\n"
-                "from quantaalpha.forecast_agent.solution_search import forecast_search_from_fire\n"
-                f"kwargs = json.loads({ _json.dumps(_json.dumps(payload, ensure_ascii=False)) })\n"
-                "forecast_search_from_fire(**kwargs)\n"
-            )
-
-        cmd = [python_bin, "-c", code]
-
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            cwd=str(PROJECT_ROOT),
-            env=env,
+    awaiting = ((task.get("metrics") or {}).get("awaiting_confirmation") or {})
+    if not awaiting:
+        raise HTTPException(status_code=409, detail="当前任务不在等待确认状态")
+    if req.checkpoint and req.checkpoint != awaiting.get("checkpoint"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"checkpoint 不匹配，当前等待: {awaiting.get('checkpoint')}",
         )
-        task["pid"] = proc.pid
-        task["progress"]["phase"] = "running"
-        task["progress"]["message"] = "正在执行方案搜索..."
-        task["progress"]["timestamp"] = _now()
-        await _broadcast(task_id, {"type": "progress", "taskId": task_id, "data": task["progress"], "timestamp": _now()})
+    user_message = str(req.message or "").strip()
+    checkpoint = str(awaiting.get("checkpoint") or "")
+    from quantaalpha.forecast_agent.gas_forecast_flow import parse_continue_message
 
-        while True:
-            line_bytes = await proc.stdout.readline()
-            if not line_bytes:
-                break
-            line = _decode_subprocess_line(line_bytes).rstrip()
-            if not line:
-                continue
+    try:
+        parsed_continue = parse_continue_message(
+            checkpoint,
+            awaiting.get("payload") or {},
+            user_message,
+            req_overrides=req.overrides,
+            req_approved=bool(req.approved),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    approved = bool(parsed_continue.get("approved", True))
+    overrides = parsed_continue.get("overrides") if isinstance(parsed_continue.get("overrides"), dict) else {}
 
-            level = "info"
-            if "ERROR" in line or "Error" in line:
-                level = "error"
-            elif "WARNING" in line:
-                level = "warning"
-            elif "完成" in line or "success" in line.lower():
-                level = "success"
+    _forecast_continue_payloads[task_id] = {
+        "approved": approved,
+        "overrides": overrides,
+        "message": user_message,
+    }
+    event = _forecast_continue_events.get(task_id)
+    if isinstance(event, asyncio.Event):
+        event.set()
 
-            log_entry = {"id": _gen_id(), "timestamp": _now(), "level": level, "message": line[:500]}
-            task["logs"].append(log_entry)
-            if len(task["logs"]) > 2000:
-                task["logs"] = task["logs"][-2000:]
-
-            await _broadcast(task_id, {"type": "log", "taskId": task_id, "data": log_entry, "timestamp": _now()})
-
-            if any(kw in line for kw in ["forecast_search", "solution_", "leaderboard", "feedback", "完成"]):
-                task["progress"]["message"] = line[:200]
-                task["progress"]["timestamp"] = _now()
-                await _broadcast(task_id, {"type": "progress", "taskId": task_id, "data": task["progress"], "timestamp": _now()})
-
-        exit_code = await proc.wait()
-        task["pid"] = None
-        task["status"] = "completed" if exit_code == 0 else "failed"
-        task["updatedAt"] = _now()
-
-        if exit_code == 0:
-            task["progress"]["phase"] = "completed"
-            task["progress"]["progress"] = 100
-            task["progress"]["message"] = "方案搜索完成"
-            _load_forecast_search_results(task, output_dir)
-        else:
-            task["progress"]["message"] = f"方案搜索失败 (exit code: {exit_code})"
-
-        await _broadcast(task_id, {
-            "type": "result",
-            "taskId": task_id,
-            "data": {"status": task["status"], "metrics": task.get("metrics", {})},
+    if user_message:
+        if not isinstance(task.get("metrics"), dict):
+            task["metrics"] = {}
+        msg_list = task["metrics"].get("agent_messages")
+        if not isinstance(msg_list, list):
+            msg_list = []
+        user_msg = {
+            "role": "user",
+            "stage": awaiting.get("checkpoint") or "",
+            "messageType": "user_reply",
+            "text": user_message,
+            "payload": {"approved": approved, "overrides": overrides},
+            "needConfirm": False,
             "timestamp": _now(),
-        })
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        task["status"] = "failed"
-        task["progress"]["message"] = str(e)
-        task["updatedAt"] = _now()
-        await _broadcast(task_id, {"type": "error", "taskId": task_id, "data": {"error": str(e)}, "timestamp": _now()})
-
-
-def _load_forecast_search_results(task: Dict[str, Any], output_dir: str):
-    """Load forecast_search outputs for the UI."""
-    try:
-        out = Path(output_dir)
-        if not out.is_absolute():
-            out = PROJECT_ROOT / out
-
-        metrics: Dict[str, Any] = {}
-
-        leaderboard_path = out / "solution_leaderboard.csv"
-        if leaderboard_path.exists():
-            import pandas as pd
-
-            df = pd.read_csv(leaderboard_path)
-            metrics["leaderboard"] = df.to_dict(orient="records")
-            metrics["leaderboard_csv"] = str(leaderboard_path)
-
-        library_path = out / "solution_library.json"
-        if library_path.exists():
-            metrics["solution_library_json"] = str(library_path)
-            metrics["solution_library"] = json.loads(library_path.read_text(encoding="utf-8"))
-
-        feedback_json = out / "forecast_feedback.json"
-        if feedback_json.exists():
-            metrics["forecast_feedback_json"] = str(feedback_json)
-            metrics["forecast_feedback"] = json.loads(feedback_json.read_text(encoding="utf-8"))
-
-        feedback_md = out / "forecast_feedback.md"
-        if feedback_md.exists():
-            metrics["forecast_feedback_md"] = str(feedback_md)
-            metrics["forecast_feedback_md_text"] = feedback_md.read_text(encoding="utf-8", errors="replace")
-
-        fixed_model = "xgboost"
-        if isinstance(metrics.get("solution_library"), dict):
-            fixed_model = str(metrics["solution_library"].get("fixed_model") or fixed_model)
-
-        solution_test_results: Dict[str, Any] = {}
-        for row in metrics.get("leaderboard", []):
-            if not isinstance(row, dict):
-                continue
-            sid = row.get("solution_id")
-            if not sid:
-                continue
-            model_name = str(row.get("model") or fixed_model)
-            out_raw = row.get("output_dir")
-            if out_raw:
-                model_dir = Path(str(out_raw))
-                if not model_dir.is_absolute():
-                    model_dir = PROJECT_ROOT / model_dir
-            else:
-                model_dir = out / "solutions" / str(sid) / model_name
-
-            points = _load_forecast_test_points_for_ui(model_dir, model_name)
-            curve = [
-                {"ds": p["ds"], "yhat": p.get("yhat"), "y": p.get("y")}
-                for p in points
-                if p.get("ds")
-            ]
-            solution_test_results[str(sid)] = {
-                "solution_id": sid,
-                "name": row.get("name"),
-                "model": model_name,
-                "mape": row.get("MAPE"),
-                "rmse": row.get("RMSE"),
-                "r2": row.get("R2"),
-                "curve": curve,
-                "table": points,
-            }
-        if solution_test_results:
-            metrics["solution_test_results"] = solution_test_results
-
-        task["metrics"] = metrics
-    except Exception:
-        import traceback
-        traceback.print_exc()
-
-async def _run_forecast(
-    task_id: str,
-    req: ForecastStartRequest,
-    config_path: str,
-    output_dir: str,
-):
-    task = tasks[task_id]
-    try:
-        env = os.environ.copy()
-        env.update(_load_dotenv_dict())
-        # Force child Python output to UTF-8 to reduce mojibake on Windows.
-        env.setdefault("PYTHONIOENCODING", "utf-8")
-        env.setdefault("PYTHONUTF8", "1")
-
-        dotenv = _load_dotenv_dict()
-        conda_env = dotenv.get("CONDA_ENV_NAME", "quantaalpha")
-        python_bin = sys.executable
-        for prefix in [
-            os.path.expanduser(f"~/.conda/envs/{conda_env}"),
-        ]:
-            candidate = os.path.join(prefix, "bin", "python")
-            if os.path.isfile(candidate):
-                python_bin = candidate
-                break
-            candidate_win = os.path.join(prefix, "python.exe")
-            if os.path.isfile(candidate_win):
-                python_bin = candidate_win
-                break
-
-        cmd = [
-            python_bin,
-            "-m",
-            "quantaalpha.forecast_agent.cli",
-            "--config",
-            config_path,
-            "--model",
-            req.model,
-            "--output-dir",
-            output_dir,
-        ]
-        if req.province:
-            cmd.extend(["--province", req.province])
-        if req.excel:
-            cmd.extend(["--excel", req.excel])
-        if req.asOfMonth:
-            cmd.extend(["--as-of-month", req.asOfMonth])
-        if req.testStart:
-            cmd.extend(["--test-start", req.testStart])
-        if req.testEnd:
-            cmd.extend(["--test-end", req.testEnd])
-        if req.contextLen is not None:
-            cmd.extend(["--context-len", str(req.contextLen)])
-        if req.candidateModels:
-            cmd.extend(["--candidate-models", req.candidateModels])
-        if req.selectionMetric:
-            cmd.extend(["--selection-metric", req.selectionMetric])
-        if req.timesfmDevice:
-            cmd.extend(["--timesfm-device", req.timesfmDevice])
-        if req.modelFeatures:
-            cmd.extend(["--model-features-json", json.dumps(req.modelFeatures, ensure_ascii=False)])
-
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            cwd=str(PROJECT_ROOT),
-            env=env,
-        )
-        task["pid"] = proc.pid
-
-        while True:
-            line_bytes = await proc.stdout.readline()
-            if not line_bytes:
-                break
-            line = _decode_subprocess_line(line_bytes).rstrip()
-            if not line:
-                continue
-
-            level = "info"
-            if "ERROR" in line or "Error" in line:
-                level = "error"
-            elif "WARNING" in line:
-                level = "warning"
-            elif "完成" in line or "success" in line.lower():
-                level = "success"
-
-            log_entry = {
-                "id": _gen_id(),
-                "timestamp": _now(),
-                "level": level,
-                "message": line[:500],
-            }
-            task["logs"].append(log_entry)
-            if len(task["logs"]) > 2000:
-                task["logs"] = task["logs"][-2000:]
-
-            await _broadcast(task_id, {
-                "type": "log",
+        }
+        msg_list.append(user_msg)
+        task["metrics"]["agent_messages"] = msg_list[-200:]
+        task["metrics"]["agent_message"] = user_msg
+        await _broadcast(
+            task_id,
+            {
+                "type": "metrics",
                 "taskId": task_id,
-                "data": log_entry,
+                "data": {"agent_message": user_msg},
                 "timestamp": _now(),
-            })
+            },
+        )
 
-            if any(kw in line for kw in ["forecast", "预测", "MAPE", "RMSE", "backend", "完成"]):
-                task["progress"]["message"] = line[:200]
-                task["progress"]["timestamp"] = _now()
-                await _broadcast(task_id, {
-                    "type": "progress",
-                    "taskId": task_id,
-                    "data": task["progress"],
-                    "timestamp": _now(),
-                })
-
-        exit_code = await proc.wait()
-        task["pid"] = None
-        task["status"] = "completed" if exit_code == 0 else "failed"
-        task["updatedAt"] = _now()
-
-        if exit_code == 0:
-            task["progress"]["phase"] = "completed"
-            task["progress"]["progress"] = 100
-            task["progress"]["message"] = "预测完成"
-            _load_forecast_results(task, output_dir, req.model)
-        else:
-            task["progress"]["message"] = f"预测失败 (exit code: {exit_code})"
-
-        await _broadcast(task_id, {
-            "type": "result",
-            "taskId": task_id,
-            "data": {"status": task["status"], "metrics": task.get("metrics", {})},
-            "timestamp": _now(),
-        })
-
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        task["status"] = "failed"
-        task["progress"]["message"] = str(e)
-        task["updatedAt"] = _now()
-        await _broadcast(task_id, {
-            "type": "error",
-            "taskId": task_id,
-            "data": {"error": str(e)},
-            "timestamp": _now(),
-        })
+    log_entry = {
+        "id": _gen_id(),
+        "timestamp": _now(),
+        "level": "info",
+        "message": f"收到继续确认: checkpoint={awaiting.get('checkpoint')} approved={approved} overrides={json.dumps(overrides, ensure_ascii=False)}",
+    }
+    task["logs"].append(log_entry)
+    if len(task["logs"]) > 2000:
+        task["logs"] = task["logs"][-2000:]
+    await _broadcast(task_id, {
+        "type": "log",
+        "taskId": task_id,
+        "data": log_entry,
+        "timestamp": _now(),
+    })
+    return ApiResponse(success=True, data={"task": _task_for_api(task)}, message="已提交继续指令")
 
 
 def _load_forecast_test_points_for_ui(model_dir: Path, model_name: str) -> list[dict[str, Any]]:
@@ -1992,74 +1927,6 @@ def _load_forecast_curve_for_ui(model_dir: Path, model_name: str) -> list[dict[s
     if "ds" not in forecast_df.columns or "yhat" not in forecast_df.columns:
         return []
     return [{"ds": str(r["ds"])[:10], "yhat": float(r["yhat"])} for r in forecast_df.to_dict(orient="records")]
-
-
-def _resolve_forecast_summary_path(out: Path, model: str) -> Path | None:
-    """Pick summary JSON for UI: explicit model first, then auto aggregate."""
-    if model and model != "auto":
-        per_model = out / model / f"{model}_best_summary.json"
-        if per_model.exists():
-            return per_model
-    for candidate in (
-        out / "forecast_result.json",
-        out / "model_selection_summary.json",
-    ):
-        if candidate.exists():
-            return candidate
-    if model and model != "auto":
-        per_model = out / model / f"{model}_best_summary.json"
-        return per_model if per_model.exists() else None
-    return None
-
-
-def _load_forecast_results(task: Dict[str, Any], output_dir: str, model: str):
-    """Load forecast summary JSON and optional forecast curve for the UI."""
-    try:
-        out = Path(output_dir)
-        if not out.is_absolute():
-            out = PROJECT_ROOT / out
-
-        summary_path = _resolve_forecast_summary_path(out, model)
-
-        metrics: Dict[str, Any] = {}
-        if summary_path and summary_path.exists():
-            with open(summary_path, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-            if raw.get("best_result"):
-                best = raw["best_result"]
-                metrics["best_model"] = raw.get("best_model") or best.get("backend")
-                metrics["test_metrics"] = best.get("test_metrics") or {}
-                metrics["errors"] = raw.get("errors", {})
-                metrics["candidates"] = [
-                    {
-                        "backend": c.get("backend"),
-                        "test_metrics": c.get("test_metrics", {}),
-                        "feature_cols_used": c.get("feature_cols_used")
-                        or (c.get("outputs") or {}).get("feature_cols_used"),
-                    }
-                    for c in raw.get("candidates", [])
-                ]
-            else:
-                metrics["best_model"] = raw.get("best_model") or raw.get("backend")
-                metrics["test_metrics"] = raw.get("test_metrics") or raw.get("raw", {}).get(
-                    "test_metrics", {}
-                )
-                metrics["feature_set"] = raw.get("feature_set")
-                metrics["feature_cols_used"] = raw.get("feature_cols_used")
-
-        # 曲线：UI 选了具体模型时优先该模型目录，避免仍显示 auto 比选的最优模型
-        display_model = model if model and model != "auto" else metrics.get("best_model")
-        if display_model and display_model not in ("auto", "auto_select"):
-            model_dir = out / str(display_model)
-            curve = _load_forecast_curve_for_ui(model_dir, str(display_model))
-            if curve:
-                metrics["forecast_curve"] = curve
-            metrics["display_model"] = display_model
-
-        task["metrics"] = metrics
-    except Exception:
-        import traceback
-        traceback.print_exc()
 
 
 # ---- System config endpoints ----

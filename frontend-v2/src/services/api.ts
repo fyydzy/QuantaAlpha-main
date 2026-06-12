@@ -240,22 +240,6 @@ export async function getWeatherDaily(file: string) {
 
 // ========================== Forecast API ==========================
 
-export interface ForecastStartParams {
-  model?: string;
-  province?: string;
-  excel?: string;
-  asOfMonth?: string;
-  testStart?: string;
-  testEnd?: string;
-  outputDir?: string;
-  contextLen?: number;
-  candidateModels?: string;
-  configPath?: string;
-  selectionMetric?: string;
-  timesfmDevice?: string;
-  modelFeatures?: Record<string, string[]>;
-}
-
 export interface ForecastQaParams {
   outputDir: string;
   model: string;
@@ -271,19 +255,23 @@ export interface ForecastQaResponse {
   featureColsUsed: string[];
 }
 
-export async function startForecast(params: ForecastStartParams) {
-  return request<{ taskId: string; task: Task }>('/api/v1/forecast/start', {
-    method: 'POST',
-    body: JSON.stringify(params),
-  });
+export interface ForecastAgentStartParams {
+  query: string;
+  province?: string;
+  candidateModels?: string;
+  outputDir?: string;
+  contextLen?: number;
+  maxFeatureCount?: number;
+  importanceTopK?: number;
+  requiredFeatures?: string[];
+  qaQuery?: string;
 }
 
-export async function getForecastStatus(taskId: string) {
-  return request<{ task: Task }>(`/api/v1/forecast/${taskId}`);
-}
-
-export async function cancelForecast(taskId: string) {
-  return request(`/api/v1/forecast/${taskId}`, { method: 'DELETE' });
+export interface ForecastAgentContinueParams {
+  checkpoint?: string;
+  approved?: boolean;
+  overrides?: Record<string, any>;
+  message?: string;
 }
 
 export async function askForecastQa(params: ForecastQaParams) {
@@ -293,37 +281,26 @@ export async function askForecastQa(params: ForecastQaParams) {
   });
 }
 
-// ========================== Forecast Search API ==========================
-
-export interface ForecastSearchStartParams {
-  goal: string;
-  province?: string;
-  asOfMonth?: string;
-  testStart?: string;
-  testEnd?: string;
-  outputDir?: string;
-  contextLen?: number;
-  model?: string;
-  numberOfSolutions?: number;
-  maxFeatureCount?: number;
-  requiredFeatures?: string[];
-  configPath?: string;
-  onlyFeedback?: boolean;
-}
-
-export async function startForecastSearch(params: ForecastSearchStartParams) {
-  return request<{ taskId: string; task: Task }>('/api/v1/forecast_search/start', {
+export async function startForecastAgent(params: ForecastAgentStartParams) {
+  return request<{ taskId: string; task: Task }>('/api/v1/forecast/agent/start', {
     method: 'POST',
     body: JSON.stringify(params),
   });
 }
 
-export async function getForecastSearchStatus(taskId: string) {
-  return request<{ task: Task }>(`/api/v1/forecast_search/${taskId}`);
+export async function getForecastAgentStatus(taskId: string) {
+  return request<{ task: Task }>(`/api/v1/forecast/agent/${taskId}`);
 }
 
-export async function cancelForecastSearch(taskId: string) {
-  return request(`/api/v1/forecast_search/${taskId}`, { method: 'DELETE' });
+export async function cancelForecastAgent(taskId: string) {
+  return request(`/api/v1/forecast/agent/${taskId}`, { method: 'DELETE' });
+}
+
+export async function continueForecastAgent(taskId: string, params: ForecastAgentContinueParams) {
+  return request<{ task: Task }>(`/api/v1/forecast/agent/${taskId}/continue`, {
+    method: 'POST',
+    body: JSON.stringify(params),
+  });
 }
 
 // ========================== System Config API ==========================
