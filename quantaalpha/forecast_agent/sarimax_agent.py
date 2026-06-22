@@ -31,6 +31,7 @@ from quantaalpha.forecast_agent.data import (
     filter_through_period,
     forecast_metrics,
     format_month_ds_for_display,
+    feature_set_from_task,
     load_task_context,
     normalize_period_column,
 )
@@ -162,15 +163,22 @@ def _prepare_train_and_future(
     return train_df, future_df
 
 
+def _sarimax_exog_cols(feature_set: list[str] | None) -> list[str]:
+    if not feature_set:
+        return list(SARIMAX_EXOG_COLS)
+    return list(feature_set)
+
+
 class SarimaxEvaluator(ForecastEvaluator):
     def evaluate(self, task: ForecastTask, subjects: ForecastSubjects) -> ForecastFeedback:
         ctx = load_task_context(task)
         params: SarimaxHyperParams = subjects.params  # type: ignore[assignment]
         try:
             train_df, future_df = _prepare_train_and_future(ctx, params)
+            exog_cols = _sarimax_exog_cols(feature_set_from_task(task))
             y_train = train_df[TARGET_COL].to_numpy(dtype=float)
-            x_train = train_df[list(SARIMAX_EXOG_COLS)].to_numpy(dtype=float)
-            x_future = future_df[list(SARIMAX_EXOG_COLS)].to_numpy(dtype=float)
+            x_train = train_df[exog_cols].to_numpy(dtype=float)
+            x_future = future_df[exog_cols].to_numpy(dtype=float)
 
             model = _fit_auto_sarimax(y_train, x_train)
             yhat = np.asarray(model.predict(n_periods=ctx.horizon, X=x_future), dtype=float)
@@ -278,14 +286,22 @@ class AutoSarimaxForecastAgent(ForecastAgent):
     def refit_and_forecast(self, task: ForecastTask, params: SarimaxHyperParams) -> dict[str, Any]:
         ctx = load_task_context(task)
         train_df, future_df = _prepare_train_and_future(ctx, params)
+        fs = feature_set_from_task(task)
+        exog_cols = _sarimax_exog_cols(fs)
         y_train = train_df[TARGET_COL].to_numpy(dtype=float)
-        x_train = train_df[list(SARIMAX_EXOG_COLS)].to_numpy(dtype=float)
-        x_future = future_df[list(SARIMAX_EXOG_COLS)].to_numpy(dtype=float)
+        x_train = train_df[exog_cols].to_numpy(dtype=float)
+        x_future = future_df[exog_cols].to_numpy(dtype=float)
 
         model = _fit_auto_sarimax(y_train, x_train)
         yhat = np.asarray(model.predict(n_periods=ctx.horizon, X=x_future), dtype=float)
         forecast_df = pd.DataFrame({"ds": ctx.future_index, "yhat": yhat})
-        return {"series": ctx.series, "forecast_df": forecast_df, "ctx": ctx}
+        return {
+            "series": ctx.series,
+            "forecast_df": forecast_df,
+            "ctx": ctx,
+            "feature_set": fs,
+            "feature_cols_used": exog_cols,
+        }
 
     def save_outputs(
         self,
@@ -327,12 +343,14 @@ class AutoSarimaxForecastAgent(ForecastAgent):
                 **ctx.metadata,
                 "horizon": ctx.horizon,
                 "selection_metric": self.selection_metric,
-                "exog_cols": list(SARIMAX_EXOG_COLS),
+                "exog_cols": final_result.get("feature_cols_used", list(SARIMAX_EXOG_COLS)),
             },
             "best_params": best_step.evolvable_subjects.params.to_dict(),
             "best_feedback": asdict(best_step.feedback) if best_step.feedback else {},
             "trace_size": len(self.trace),
             "test_metrics": forecast_metrics(y_true, y_pred),
+            "feature_set": final_result.get("feature_set", list(getattr(task, "feature_set", []) or [])),
+            "feature_cols_used": final_result.get("feature_cols_used", list(SARIMAX_EXOG_COLS)),
             result_path_key: str(result_path),
         }
         summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")

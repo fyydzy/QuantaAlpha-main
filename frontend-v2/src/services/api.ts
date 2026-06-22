@@ -158,6 +158,151 @@ export async function cancelBacktest(taskId: string) {
   return request(`/api/v1/backtest/${taskId}`, { method: 'DELETE' });
 }
 
+// ========================== Weather CSV API ==========================
+
+export interface WeatherDataSource {
+  title: string;
+  dataset: string;
+  url: string;
+  variable: string;
+  step: string;
+  horizon: string;
+  initDate: string;
+  area: string;
+  gridNote: string;
+}
+
+export interface WeatherFilesResponse {
+  previewFiles: string[];
+  dailyFiles: string[];
+  dataSource: WeatherDataSource;
+  weatherDir: string;
+}
+
+export interface WeatherPreviewMeta {
+  file: string;
+  dates: string[];
+  hoursByDate: Record<string, number[]>;
+  gridLatitude: number | null;
+  gridLongitude: number | null;
+  rowCount: number;
+}
+
+export interface WeatherPreviewValue {
+  dateBj: string;
+  hourBj: number;
+  temperatureC: number;
+  aggMode: 'mean' | 'member';
+  member: number | null;
+  memberCount: number;
+  sampleCount: number;
+  tempMinC: number;
+  tempMaxC: number;
+  tempP10C?: number;
+  tempP50C?: number;
+  tempP90C?: number;
+  validTimeUtc?: string | null;
+  validTimeBj?: string | null;
+}
+
+export interface WeatherDailyRow {
+  dateBj: string;
+  tempMeanC: number; // backwards-compatible field name in frontend
+  tempP10C?: number;
+  tempP50C?: number;
+  tempP90C?: number;
+}
+
+export async function getWeatherFiles() {
+  return request<WeatherFilesResponse>('/api/v1/weather/files');
+}
+
+export async function getWeatherPreviewMeta(file: string) {
+  return request<WeatherPreviewMeta>(
+    `/api/v1/weather/preview/meta?file=${encodeURIComponent(file)}`
+  );
+}
+
+export async function getWeatherPreviewValue(
+  file: string,
+  dateBj: string,
+  hourBj: number
+) {
+  const q = new URLSearchParams({ file, date_bj: dateBj, hour_bj: String(hourBj) });
+  return request<WeatherPreviewValue>(`/api/v1/weather/preview/value?${q}`);
+}
+
+export async function getWeatherDaily(file: string) {
+  return request<{ file: string; rows: WeatherDailyRow[]; tempColumn: string }>(
+    `/api/v1/weather/daily?file=${encodeURIComponent(file)}`
+  );
+}
+
+// ========================== Forecast API ==========================
+
+export interface ForecastQaParams {
+  outputDir: string;
+  model: string;
+  query: string;
+  selectedFeatures?: string[];
+}
+
+export interface ForecastQaResponse {
+  answer: string;
+  modelUsed: string;
+  rowsUsed: number;
+  dataMode: 'test_only' | 'pred_only';
+  featureColsUsed: string[];
+}
+
+export interface ForecastAgentStartParams {
+  query: string;
+  province?: string;
+  candidateModels?: string;
+  outputDir?: string;
+  contextLen?: number;
+  maxFeatureCount?: number;
+  importanceTopK?: number;
+  requiredFeatures?: string[];
+  qaQuery?: string;
+}
+
+export interface ForecastAgentContinueParams {
+  checkpoint?: string;
+  approved?: boolean;
+  overrides?: Record<string, any>;
+  message?: string;
+}
+
+export async function askForecastQa(params: ForecastQaParams) {
+  return request<ForecastQaResponse>('/api/v1/forecast/qa', {
+    method: 'POST',
+    body: JSON.stringify(params),
+  });
+}
+
+export async function startForecastAgent(params: ForecastAgentStartParams) {
+  return request<{ taskId: string; task: Task }>('/api/v1/forecast/agent/start', {
+    method: 'POST',
+    body: JSON.stringify(params),
+  });
+}
+
+export async function getForecastAgentStatus(taskId: string) {
+  return request<{ task: Task }>(`/api/v1/forecast/agent/${taskId}`);
+}
+
+export async function cancelForecastAgent(taskId: string) {
+  return request(`/api/v1/forecast/agent/${taskId}`, { method: 'DELETE' });
+}
+
+export async function continueForecastAgent(taskId: string, params: ForecastAgentContinueParams) {
+  return request<{ task: Task }>(`/api/v1/forecast/agent/${taskId}/continue`, {
+    method: 'POST',
+    body: JSON.stringify(params),
+  });
+}
+
 // ========================== System Config API ==========================
 
 export async function getSystemConfig() {

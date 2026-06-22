@@ -247,17 +247,59 @@ def normalize_period_column(df: pd.DataFrame, col: str = MONTH_COL) -> pd.DataFr
     return out.sort_values(DATE_COL).reset_index(drop=True)
 
 
-def find_processed_excel(province: str | None = None) -> str:
-    prov = PROCESSED_PROVINCE if province is None else province
-    candidates = [
-        os.path.join("data", "processed_data", f"{prov}.xlsx"),
-        os.path.join("processed_data", f"{prov}.xlsx"),
+def _province_name_candidates(province: str) -> list[str]:
+    """Generate compatible province name candidates for processed Excel lookup."""
+    raw = str(province or "").strip()
+    if not raw:
+        return []
+
+    names = [raw]
+    suffixes = [
+        "维吾尔自治区",
+        "壮族自治区",
+        "回族自治区",
+        "特别行政区",
+        "自治区",
+        "省",
+        "市",
     ]
-    for path in candidates:
+    for suffix in suffixes:
+        if raw.endswith(suffix):
+            stripped = raw[: -len(suffix)].strip()
+            if stripped:
+                names.append(stripped)
+            break
+
+    dedup: list[str] = []
+    for name in names:
+        if name and name not in dedup:
+            dedup.append(name)
+    return dedup
+
+
+def find_processed_excel(province: str | None = None) -> str:
+    prov = PROCESSED_PROVINCE if province is None else str(province).strip()
+    data_root = os.environ.get("FORECAST_DATA_DIR", "data/processed_data")
+    province_names = _province_name_candidates(prov) or [PROCESSED_PROVINCE]
+    roots = [
+        data_root,
+        os.path.join("data", "processed_data"),
+        os.path.join("processed_data"),
+    ]
+    for name in province_names:
+        for root in roots:
+            path = os.path.join(root, f"{name}.xlsx")
+            if os.path.exists(path):
+                return path
+    expected = province_names[0] if province_names else prov
+    for path in [
+        os.path.join(data_root, f"{expected}.xlsx"),
+        os.path.join("data", "processed_data", f"{expected}.xlsx"),
+    ]:
         if os.path.exists(path):
             return path
     raise FileNotFoundError(
-        f"未找到 {prov} 的 processed 文件，请确认 data/processed_data/{prov}.xlsx 存在。"
+        f"未找到 {prov} 的 processed 文件，请确认 data/processed_data/{expected}.xlsx 存在。"
     )
 
 
@@ -355,6 +397,11 @@ def filter_periods_in(df: pd.DataFrame, periods: list[str]) -> pd.DataFrame:
         .sort_values(sort_col)
         .copy()
     )
+
+
+def feature_set_from_task(task: ForecastTask) -> list[str]:
+    """Configured feature columns from forecast YAML model_features."""
+    return list(getattr(task, "feature_set", None) or [])
 
 
 def tabular_feature_columns(df: pd.DataFrame) -> list[str]:
@@ -582,6 +629,7 @@ __all__ = [
     "period_between",
     "filter_through_period",
     "filter_periods_in",
+    "feature_set_from_task",
     "tabular_feature_columns",
     "period_range",
     "month_range",

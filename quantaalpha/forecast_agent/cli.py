@@ -2,65 +2,19 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
-from quantaalpha.forecast_agent.framework import ForecastTask
-from quantaalpha.forecast_agent.catboost_agent import AutoCatboostForecastAgent
-from quantaalpha.forecast_agent.elasticnet_agent import AutoElasticnetForecastAgent
-from quantaalpha.forecast_agent.lasso_agent import AutoLassoForecastAgent
-from quantaalpha.forecast_agent.lstm_agent import AutoLstmForecastAgent
-from quantaalpha.forecast_agent.lightgbm_agent import AutoLightgbmForecastAgent
-from quantaalpha.forecast_agent.random_forest_agent import AutoRandomForestForecastAgent
-from quantaalpha.forecast_agent.ridge_agent import AutoRidgeForecastAgent
-from quantaalpha.forecast_agent.sarimax_agent import AutoSarimaxForecastAgent
-from quantaalpha.forecast_agent.timesfm_agent import AutoTimesFmForecastAgent
-from quantaalpha.forecast_agent.xgboost_agent import AutoXgboostForecastAgent
+from quantaalpha.forecast_agent.runner import (
+    DEFAULT_CANDIDATE_MODELS,
+    ForecastRunConfig,
+    MODEL_FACTORY_KEYS,
+    load_config_from_yaml,
+    merge_config_with_overrides,
+    run_forecast,
+)
 
-
-ModelFactory = Callable[[argparse.Namespace], Any]
-MODEL_FACTORIES: dict[str, ModelFactory] = {
-    "timesfm": lambda args: AutoTimesFmForecastAgent(
-        backend=args.timesfm_device,
-        selection_metric=args.selection_metric,
-    ),
-    "sarimax": lambda args: AutoSarimaxForecastAgent(
-        context_len=args.context_len,
-        selection_metric=args.selection_metric,
-    ),
-    "lasso": lambda args: AutoLassoForecastAgent(
-        context_len=args.context_len,
-        selection_metric=args.selection_metric,
-    ),
-    "elasticnet": lambda args: AutoElasticnetForecastAgent(
-        context_len=args.context_len,
-        selection_metric=args.selection_metric,
-    ),
-    "ridge": lambda args: AutoRidgeForecastAgent(
-        context_len=args.context_len,
-        selection_metric=args.selection_metric,
-    ),
-    "lstm": lambda args: AutoLstmForecastAgent(
-        context_len=args.context_len,
-        selection_metric=args.selection_metric,
-    ),
-    "xgboost": lambda args: AutoXgboostForecastAgent(
-        context_len=args.context_len,
-        selection_metric=args.selection_metric,
-    ),
-    "lightgbm": lambda args: AutoLightgbmForecastAgent(
-        context_len=args.context_len,
-        selection_metric=args.selection_metric,
-    ),
-    "catboost": lambda args: AutoCatboostForecastAgent(
-        context_len=args.context_len,
-        selection_metric=args.selection_metric,
-    ),
-    "random_forest": lambda args: AutoRandomForestForecastAgent(
-        context_len=args.context_len,
-        selection_metric=args.selection_metric,
-    ),
-}
+# 向后兼容：外部可继续 from quantaalpha.forecast_agent.cli import MODEL_FACTORIES
+MODEL_FACTORIES = MODEL_FACTORY_KEYS
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -68,27 +22,20 @@ def build_parser() -> argparse.ArgumentParser:
         description="旬度 Excel 燃气数据预测（预留多模型入口）。",
     )
     parser.add_argument(
+        "--config",
+        default=None,
+        help="YAML 配置文件路径（如 configs/forecast.yaml）；命令行参数覆盖 YAML",
+    )
+    parser.add_argument(
         "--model",
-        choices=[
-            "auto",
-            "timesfm",
-            "sarimax",
-            "lasso",
-            "elasticnet",
-            "ridge",
-            "lstm",
-            "xgboost",
-            "lightgbm",
-            "catboost",
-            "random_forest",
-        ],
-        default="timesfm",
+        choices=["auto", *sorted(MODEL_FACTORY_KEYS)],
+        default=None,
         help="模型后端名称；auto 为多模型自动比选。",
     )
     parser.add_argument(
         "--candidate-models",
-        default="sarimax,lasso,elasticnet,ridge,lstm,xgboost,lightgbm,catboost,random_forest",
-        help="仅在 --model auto 时生效，逗号分隔的候选模型列表。",
+        default=None,
+        help=f"仅在 --model auto 时生效。默认: {DEFAULT_CANDIDATE_MODELS}",
     )
     parser.add_argument("--excel", default=None, help="Excel 路径（与 --province 二选一）")
     parser.add_argument(
@@ -105,161 +52,66 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--test-end", default=None, help="测试结束旬开始日 YYYY-MM-DD")
     parser.add_argument(
         "--output-dir",
-        default="forecast_agent_output",
-        help="输出根目录；单模型写入 {output_dir}/{model}，auto 会为每个候选模型分别建子目录并产出汇总文件",
+        default=None,
+        help="输出根目录；单模型写入 {output_dir}/{model}，auto 会为每个候选模型分别建子目录",
     )
     parser.add_argument(
         "--timesfm-device",
         choices=["cpu", "gpu"],
-        default="cpu",
+        default=None,
         help="TimesFM 推理设备",
     )
     parser.add_argument(
         "--selection-metric",
         choices=["mape", "score"],
-        default="mape",
+        default=None,
         help="选参指标：mape 或 0.7*SMAPE+0.3*RMSE 的 score",
     )
     parser.add_argument(
         "--context-len",
         type=int,
-        default=111,
-        help="各模型使用的固定历史窗口长度（旬数，非月数）；可先由 TimesFM 实验结果确定后传入",
+        default=None,
+        help="各模型使用的固定历史窗口长度（旬数，非月数）",
+    )
+    parser.add_argument(
+        "--model-features-json",
+        default=None,
+        help="JSON 字符串，覆盖 YAML 的 model_features（例如: {\"lasso\":[\"HDD\",\"Lag_36\"]}）",
     )
     return parser
 
 
-def _selection_key(feedback: dict[str, Any], metric: str) -> tuple[float, float]:
-    primary = float(feedback.get(metric, float("inf")))
-    secondary_name = "score" if metric == "mape" else "mape"
-    secondary = float(feedback.get(secondary_name, float("inf")))
-    return (primary, secondary)
-
-
-def _extract_test_metrics(result: dict[str, Any]) -> dict[str, float] | None:
-    outputs = result.get("outputs", {})
-    if not isinstance(outputs, dict):
-        return None
-    summary_path = outputs.get("summary_json")
-    if not summary_path:
-        return None
-    try:
-        summary = json.loads(Path(summary_path).read_text(encoding="utf-8"))
-    except Exception:
-        return None
-    metrics = summary.get("test_metrics")
-    return metrics if isinstance(metrics, dict) else None
-
-
-def _test_metrics_selection_key(test_metrics: dict[str, Any] | None) -> tuple[float, float]:
-    if not isinstance(test_metrics, dict):
-        return (float("inf"), float("inf"))
-    # 兼容旧键名：MAPE(%) -> MAPE
-    mape = float(test_metrics.get("MAPE", test_metrics.get("MAPE(%)", float("inf"))))
-    rmse = float(test_metrics.get("RMSE", float("inf")))
-    return (mape, rmse)
-
-
-def _run_single_model(
-    model_name: str,
-    args: argparse.Namespace,
-    base_task: ForecastTask,
-    out_root: Path,
-) -> dict[str, Any]:
-    if model_name not in MODEL_FACTORIES:
-        raise ValueError(f"Unsupported model: {model_name}")
-
-    task = ForecastTask(
-        output_dir=out_root / model_name,
-        excel_path=base_task.excel_path,
-        province=base_task.province,
-        as_of_month=base_task.as_of_month,
-        test_start=base_task.test_start,
-        test_end=base_task.test_end,
-    )
-    agent = MODEL_FACTORIES[model_name](args)
-    result = agent.run(task)
-    test_metrics = _extract_test_metrics(result)
-    if test_metrics is not None:
-        result["test_metrics"] = test_metrics
-    return result
-
-
-def _normalize_candidates(raw: str) -> list[str]:
-    candidates = [item.strip().lower() for item in raw.split(",") if item.strip()]
-    deduped: list[str] = []
-    for item in candidates:
-        if item in deduped:
-            continue
-        deduped.append(item)
-    return deduped
+def _args_to_overrides(args: argparse.Namespace) -> dict[str, Any]:
+    mapping = {
+        "model": args.model,
+        "province": args.province,
+        "excel_path": args.excel,
+        "as_of_month": args.as_of_month,
+        "test_start": args.test_start,
+        "test_end": args.test_end,
+        "output_dir": args.output_dir,
+        "context_len": args.context_len,
+        "selection_metric": args.selection_metric,
+        "candidate_models": args.candidate_models,
+        "timesfm_device": args.timesfm_device,
+    }
+    if args.model_features_json:
+        try:
+            mapping["model_features"] = json.loads(args.model_features_json)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"--model-features-json 不是合法 JSON: {exc}") from exc
+    return {k: v for k, v in mapping.items() if v is not None}
 
 
 def main() -> None:
     args = build_parser().parse_args()
-    out_root = Path(args.output_dir)
-    task_base = ForecastTask(
-        output_dir=out_root,
-        excel_path=Path(args.excel) if args.excel else None,
-        province=args.province,
-        as_of_month=args.as_of_month,
-        test_start=args.test_start,
-        test_end=args.test_end,
-    )
-
-    if args.model == "auto":
-        candidates = _normalize_candidates(args.candidate_models)
-        if not candidates:
-            raise ValueError("`--candidate-models` 不能为空。")
-
-        invalid = [m for m in candidates if m not in MODEL_FACTORIES]
-        if invalid:
-            raise ValueError(f"Unknown candidate models: {invalid}")
-
-        all_results: list[dict[str, Any]] = []
-        all_errors: dict[str, str] = {}
-        best_result: dict[str, Any] | None = None
-        best_test_metrics: dict[str, Any] | None = None
-
-        for model_name in candidates:
-            try:
-                result = _run_single_model(model_name, args, task_base, out_root)
-                all_results.append(result)
-                current_test_metrics = result.get("test_metrics")
-                if not isinstance(current_test_metrics, dict):
-                    continue
-                if best_test_metrics is None or _test_metrics_selection_key(
-                    current_test_metrics,
-                ) < _test_metrics_selection_key(best_test_metrics):
-                    best_test_metrics = current_test_metrics
-                    best_result = result
-            except Exception as exc:  # noqa: BLE001 - 聚合模式容错
-                all_errors[model_name] = str(exc)
-
-        if best_result is None:
-            raise RuntimeError(f"All candidate models failed: {all_errors}")
-
-        selection_payload = {
-            "backend": "auto_select",
-            "selection_metric": "test_metrics.MAPE",
-            "best_model": best_result.get("backend"),
-            "best_result": best_result,
-            "candidates": all_results,
-            "errors": all_errors,
-        }
-        summary_path = out_root / "model_selection_summary.json"
-        summary_path.parent.mkdir(parents=True, exist_ok=True)
-        summary_path.write_text(
-            json.dumps(selection_payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        selection_payload["outputs"] = {
-            "selection_summary_json": str(summary_path),
-        }
-        print(json.dumps(selection_payload, ensure_ascii=False, indent=2))
+    if args.config:
+        base = load_config_from_yaml(args.config)
     else:
-        result = _run_single_model(args.model, args, task_base, out_root)
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+        base = ForecastRunConfig()
+    config = merge_config_with_overrides(base, _args_to_overrides(args))
+    result = run_forecast(config)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

@@ -25,9 +25,10 @@ from quantaalpha.forecast_agent.data import (
     filter_periods_in,
     filter_through_period,
     load_tabular_feature_frame,
+    feature_set_from_task,
     load_task_context,
-    tabular_feature_columns,
 )
+from quantaalpha.forecast_agent.feature_engineering import resolve_feature_columns
 from quantaalpha.forecast_agent.framework import (
     ForecastAgent,
     ForecastEvaluator,
@@ -91,6 +92,8 @@ def _apply_context_window(df: pd.DataFrame, context_len: int) -> pd.DataFrame:
 def _prepare_train_and_future(
     ctx: TaskContext,
     params: ElasticnetHyperParams,
+    *,
+    feature_set: list[str] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
     path = str(ctx.metadata["excel_path"])
     as_of = str(ctx.metadata["as_of_month"])
@@ -109,7 +112,7 @@ def _prepare_train_and_future(
         missing = sorted(set(ctx.forecast_months) - set(future_df[MONTH_COL].astype(str)))
         raise ValueError(f"ElasticNet 特征旬不完整，缺少: {missing}")
 
-    feature_cols = tabular_feature_columns(feature_df)
+    feature_cols = resolve_feature_columns(feature_df, feature_set)
     return train_df, future_df, feature_cols
 
 
@@ -131,7 +134,9 @@ class ElasticnetEvaluator(ForecastEvaluator):
         ctx = load_task_context(task)
         params: ElasticnetHyperParams = subjects.params  # type: ignore[assignment]
         try:
-            train_df, future_df, feature_cols = _prepare_train_and_future(ctx, params)
+            train_df, future_df, feature_cols = _prepare_train_and_future(
+                ctx, params, feature_set=feature_set_from_task(task)
+            )
             X_train = train_df[feature_cols].to_numpy(dtype=float)
             y_train = train_df[TARGET_COL].to_numpy(dtype=float)
             X_future = future_df[feature_cols].to_numpy(dtype=float)
@@ -243,7 +248,8 @@ class AutoElasticnetForecastAgent(ForecastAgent):
 
     def refit_and_forecast(self, task: ForecastTask, params: ElasticnetHyperParams) -> dict[str, Any]:
         ctx = load_task_context(task)
-        train_df, future_df, feature_cols = _prepare_train_and_future(ctx, params)
+        fs = feature_set_from_task(task)
+        train_df, future_df, feature_cols = _prepare_train_and_future(ctx, params, feature_set=fs)
         X_train = train_df[feature_cols].to_numpy(dtype=float)
         y_train = train_df[TARGET_COL].to_numpy(dtype=float)
         X_future = future_df[feature_cols].to_numpy(dtype=float)
@@ -260,6 +266,8 @@ class AutoElasticnetForecastAgent(ForecastAgent):
             "alpha": float(model.alpha_),
             "l1_ratio": float(model.l1_ratio_),
             "selected_features": selected.to_dict(),
+            "feature_set": fs,
+            "feature_cols_used": list(feature_cols),
         }
 
     def save_outputs(
@@ -310,6 +318,8 @@ class AutoElasticnetForecastAgent(ForecastAgent):
             "alpha": final_result.get("alpha"),
             "l1_ratio": final_result.get("l1_ratio"),
             "selected_features": final_result.get("selected_features", {}),
+            "feature_set": final_result.get("feature_set", list(getattr(task, "feature_set", []) or [])),
+            "feature_cols_used": final_result.get("feature_cols_used", []),
             result_path_key: str(result_path),
         }
         summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")

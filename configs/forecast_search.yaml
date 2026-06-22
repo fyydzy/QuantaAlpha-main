@@ -1,0 +1,41 @@
+# 燃气旬度预测：LLM 特征组合方案搜索（第一版）
+#
+# 说明：
+# - 本配置为历史实验配置；Web 界面与后端 forecast_search 接口已下线。
+# - 前后端开发启动命令仍保留在 docs/forecast_search.md。
+#
+# 历史运行方式（CLI 入口已移除，仅保留备查）：
+#   uv run python -m quantaalpha.forecast_agent.solution_search --config configs/forecast_search.yaml
+#
+# 注意：LLM API KEY 需写在环境变量或 .env（例如 OPENAI_API_KEY / OPENAI_BASE_URL 等）
+
+goal: "降低测试集 MAPE，给出更可解释的特征组合方案"
+
+forecast:
+  province: "河北"
+  as_of_month: "2025-06-21"
+  test_start: "2025-11-01"
+  test_end: "2026-03-21"
+
+  # 第一版固定一个 tabular 模型用于公平对比特征组合
+  model: "xgboost"
+  context_len: 270
+
+  # 搜索输出根目录（会在其下创建 solutions/）
+  output_dir: "forecast_agent_output/河北"
+
+solution_search:
+  number_of_solutions: 4
+  max_feature_count: 10
+  required_features: []
+
+analysis:
+  enabled: true
+  top_k: 3
+
+output:
+  leaderboard: "forecast_agent_output/河北/solution_leaderboard.csv"
+  solution_library: "forecast_agent_output/河北/solution_library.json"
+  feedback_json: "forecast_agent_output/河北/forecast_feedback.json"
+  feedback_md: "forecast_agent_output/河北/forecast_feedback.md"
+

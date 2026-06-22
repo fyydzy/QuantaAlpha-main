@@ -1,0 +1,201 @@
+# 燃气旬度预测默认配置（CLI: quantaalpha forecast --config configs/forecast.yaml）
+#
+# model_features 用法：
+#   - 必须去掉行首 # 才会生效；只改注释、不写 "- 列名" 不会改变任何特征
+#   - 某模型下「只保留注释行」或整段省略 → 该模型用默认全集（tabular 为全部数值列）
+#   - 取消需要的行首 #，写成 YAML 列表，例如：
+#       xgboost:
+#         - HDD
+#         - Lag_36
+#   - 不要写错列名；训练前会校验列是否存在于特征工程后的表中
+
+data:
+  province: 河北
+  excel_path: null
+
+output_dir: forecast_agent_output/{province}
+
+as_of_month: "2025-06-21"
+test_start: "2025-11-01"
+test_end: "2026-03-21"
+
+model: auto
+candidate_models: sarimax,lasso,elasticnet,ridge,lstm,xgboost,lightgbm,catboost,random_forest
+
+# ---------------------------------------------------------------------------
+# 按模型启用特征（下面各段默认全部注释 = 使用默认全集/硬编码）
+# ---------------------------------------------------------------------------
+model_features:
+
+  # --- sarimax（仅上列 6 个天气外生列）---
+  sarimax:
+    - avg_temp
+    - max_temp
+    - min_temp
+    - HDD
+    - extreme_cold_days
+    - temp_range
+
+  # --- lasso（tabular 17 列任选）---
+  lasso:
+    - avg_temp
+    - max_temp
+    - min_temp
+    - temp_range
+    - HDD
+    - extreme_cold_days
+    - time_index
+    - month_sin
+    - month_cos
+    - ten_sin
+    - ten_cos
+    - is_heating_season
+    - Lag_36
+    - HDD_squared
+    - HDD_cross_Lag_36
+    - HDD_cross_HeatingSeason
+    - ColdDays_cross_Lag_36
+    - spring_rework_peak
+    - HDD_cross_spring_rework_peak
+
+  # --- elasticnet（同 lasso）---
+  elasticnet:
+    - avg_temp
+    - max_temp
+    - min_temp
+    - temp_range
+    - HDD
+    - extreme_cold_days
+    - time_index
+    - month_sin
+    - month_cos
+    - ten_sin
+    - ten_cos
+    - is_heating_season
+    - Lag_36
+    - HDD_squared
+    - HDD_cross_Lag_36
+    - HDD_cross_HeatingSeason
+    - ColdDays_cross_Lag_36
+    - spring_rework_peak
+    - HDD_cross_spring_rework_peak
+
+  # --- ridge（同 lasso）---
+  ridge:
+    # - avg_temp
+    # - max_temp
+    # - min_temp
+    # - temp_range
+    # - HDD
+    # - extreme_cold_days
+    # - time_index
+    # - month_sin
+    # - month_cos
+    # - ten_sin
+    # - ten_cos
+    # - is_heating_season
+    # - Lag_36
+    # - HDD_squared
+    # - HDD_cross_Lag_36
+    # - HDD_cross_HeatingSeason
+    # - ColdDays_cross_Lag_36
+    # - spring_rework_peak
+    # - HDD_cross_spring_rework_peak
+
+  # --- lstm（仅上列 3 列的子集）---
+  lstm:
+    - Lag_36
+    - HDD
+    - is_heating_season
+
+  # --- xgboost（tabular 17 列任选）---
+  xgboost:
+    # - avg_temp
+    # - max_temp
+    # - min_temp
+    # - temp_range
+    # - HDD
+    # - extreme_cold_days
+    # - time_index
+    # - month_sin
+    # - month_cos
+    # - ten_sin
+    # - ten_cos
+    # - is_heating_season
+    # - Lag_36
+    # - HDD_squared
+    # - HDD_cross_Lag_36
+    # - HDD_cross_HeatingSeason
+    # - ColdDays_cross_Lag_36
+    # - spring_rework_peak
+    # - HDD_cross_spring_rework_peak
+
+  # --- lightgbm（tabular 17 列任选）---
+  lightgbm:
+    - avg_temp
+    - max_temp
+    - min_temp
+    - temp_range
+    - HDD
+    - extreme_cold_days
+    - time_index
+    - month_sin
+    - month_cos
+    - ten_sin
+    - ten_cos
+    - is_heating_season
+    - Lag_36
+    - HDD_squared
+    - HDD_cross_Lag_36
+    - HDD_cross_HeatingSeason
+    - ColdDays_cross_Lag_36
+    - spring_rework_peak
+    - HDD_cross_spring_rework_peak
+
+  # --- catboost（tabular 17 列任选）---
+  catboost:
+    # - avg_temp
+    # - max_temp
+    # - min_temp
+    # - temp_range
+    # - HDD
+    # - extreme_cold_days
+    # - time_index
+    # - month_sin
+    # - month_cos
+    # - ten_sin
+    # - ten_cos
+    # - is_heating_season
+    # - Lag_36
+    # - HDD_squared
+    # - HDD_cross_Lag_36
+    # - HDD_cross_HeatingSeason
+    # - ColdDays_cross_Lag_36
+    # - spring_rework_peak
+    # - HDD_cross_spring_rework_peak
+
+  # --- random_forest（tabular 17 列任选）---
+  random_forest:
+    # - avg_temp
+    # - max_temp
+    # - min_temp
+    # - temp_range
+    # - HDD
+    # - extreme_cold_days
+    # - time_index
+    # - month_sin
+    # - month_cos
+    # - ten_sin
+    # - ten_cos
+    # - is_heating_season
+    # - Lag_36
+    # - HDD_squared
+    # - HDD_cross_Lag_36
+    # - HDD_cross_HeatingSeason
+    # - ColdDays_cross_Lag_36
+    # - spring_rework_peak
+    # - HDD_cross_spring_rework_peak
+
+context_len: 270
+selection_metric: mape
+timesfm_device: cpu

@@ -47,6 +47,9 @@ dependencies = {file = ["requirements.txt"]}
 
 [tool.setuptools.dynamic.optional-dependencies]
 docs = {file = ["requirements/docs.txt"]}
+forecast = {file = ["requirements/forecast.txt"]}
+forecast-all = {file = ["requirements/forecast-all.txt"]}
+weather = {file = ["requirements/weather.txt"]}
 
 [tool.setuptools_scm]
 local_scheme = "no-local-version"
