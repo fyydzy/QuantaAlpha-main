@@ -30,7 +30,7 @@ export const HomePage: React.FC<HomePageProps> = ({ onNavigate }) => {
         <div className="flex flex-col items-center justify-center min-h-[60vh] pb-8 animate-fade-in-up">
           <div className="text-center mb-10">
             <h2 className="text-4xl font-bold mb-4 bg-gradient-to-r from-primary via-purple-500 to-pink-500 bg-clip-text text-transparent">
-              欢迎使用 QuantaAlpha
+              欢迎使用天然气市场需求预测
             </h2>
             <p className="text-lg text-muted-foreground">
               用自然语言描述需求，AI 自动挖掘高质量量化因子

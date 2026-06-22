@@ -85,9 +85,15 @@ class ForecastQaRequest(BaseModel):
 class ForecastAgentStartRequest(BaseModel):
     """Request to start single-round forecast agent flow."""
     query: str = Field(..., description="Natural language request")
-    province: Optional[str] = Field("河北", description="Province name")
+    province: Optional[str] = Field(
+        None,
+        description="对话未提及省份时的兜底名；输出目录以 parse_intent 解析结果为准",
+    )
     candidateModels: Optional[str] = Field(None, description="Comma-separated candidate models")
-    outputDir: Optional[str] = Field(None, description="Output directory")
+    outputDir: Optional[str] = Field(
+        None,
+        description="可选自定义输出根目录，支持 {province} 占位；默认 forecast_agent_output/{省份}/agent_flow_{ts}",
+    )
     contextLen: Optional[int] = Field(270, description="Context length")
     maxFeatureCount: Optional[int] = Field(10, description="Max recommended features")
     importanceTopK: Optional[int] = Field(12, description="Top-K feature importance for prompting")
@@ -1400,10 +1406,67 @@ async def ask_forecast_qa(req: ForecastQaRequest):
         raise HTTPException(status_code=500, detail=f"LLM 问答失败: {exc}") from exc
 
 
+def _forecast_fallback_province(explicit: str | None = None) -> str:
+    for candidate in (explicit, os.environ.get("FORECAST_DEFAULT_PROVINCE"), "河北"):
+        text = str(candidate or "").strip()
+        if text:
+            return text
+    return "河北"
+
+
+def _resolve_agent_flow_out_root(
+    province: str,
+    *,
+    run_ts: str,
+    custom_output_dir: str | None = None,
+) -> Path:
+    """Web Agent 输出根目录：forecast_agent_output/{省份}/agent_flow_{ts}（或自定义 base + agent_flow_{ts}）。"""
+    prov = _forecast_fallback_province(province)
+    raw = str(custom_output_dir or "").strip()
+    if raw:
+        base = Path(raw.replace("{province}", prov))
+    else:
+        base = Path("forecast_agent_output") / prov
+    if base.name.startswith("agent_flow_"):
+        out = base
+    else:
+        out = base / f"agent_flow_{run_ts}"
+    if not out.is_absolute():
+        out = PROJECT_ROOT / out
+    return out
+
+
+def _province_display_label(name: str) -> str:
+    raw = str(name or "").strip() or "未知"
+    if raw.endswith(("省", "市", "自治区", "特别行政区")):
+        return raw
+    if raw in {"北京", "上海", "天津", "重庆"}:
+        return f"{raw}市"
+    special = {
+        "内蒙古": "内蒙古自治区",
+        "广西": "广西壮族自治区",
+        "西藏": "西藏自治区",
+        "宁夏": "宁夏回族自治区",
+        "新疆": "新疆维吾尔自治区",
+        "香港": "香港特别行政区",
+        "澳门": "澳门特别行政区",
+    }
+    return special.get(raw, f"{raw}省")
+
+
+def _display_path_for_ui(path: str) -> str:
+    p = Path(path)
+    if not p.is_absolute():
+        p = PROJECT_ROOT / p
+    try:
+        return str(p.relative_to(PROJECT_ROOT)).replace("\\", "/")
+    except ValueError:
+        return str(p).replace("\\", "/")
+
+
 async def _run_forecast_agent(
     task_id: str,
     req: ForecastAgentStartRequest,
-    output_dir: str,
 ):
     """燃气预测智能体主协程（Web 专用）。
 
@@ -1433,10 +1496,24 @@ async def _run_forecast_agent(
             raise RuntimeError("缺少 OPENAI_API_KEY，请在项目根目录 .env 中配置后重试")
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_root = Path(output_dir or f"forecast_agent_output/{req.province or '河北'}/agent_flow_{ts}")
-        if not out_root.is_absolute():
-            out_root = PROJECT_ROOT / out_root
-        out_root.mkdir(parents=True, exist_ok=True)
+        out_root: Path | None = None
+
+        def _sync_task_output_config(intent_province: str, resolved_out_root: Path) -> None:
+            if isinstance(task.get("config"), dict):
+                task["config"]["province"] = intent_province
+                task["config"]["outputDir"] = str(resolved_out_root)
+
+        def _ensure_out_root(intent_province: str) -> Path:
+            nonlocal out_root
+            resolved = _resolve_agent_flow_out_root(
+                intent_province,
+                run_ts=ts,
+                custom_output_dir=req.outputDir,
+            )
+            resolved.mkdir(parents=True, exist_ok=True)
+            out_root = resolved
+            _sync_task_output_config(intent_province, resolved)
+            return resolved
 
         def _set_progress(phase: str, progress: int, message: str) -> dict[str, Any]:
             task["progress"]["phase"] = phase
@@ -1532,7 +1609,7 @@ async def _run_forecast_agent(
         intent = await asyncio.to_thread(
             parse_intent,
             req.query,
-            default_province=str(req.province or "河北"),
+            default_province=_forecast_fallback_province(req.province),
             as_of_month=FIXED_AS_OF_DATE,
         )
         await _emit_stage("parse_intent", "我已根据你的描述解析出以下预测参数：", intent)
@@ -1546,6 +1623,20 @@ async def _run_forecast_agent(
         if intent_overrides:
             intent = apply_intent_overrides(intent, intent_overrides)
             await _emit_stage("intent_applied", "好的，我已按你的要求更新了预测参数：", intent)
+
+        out_root = _ensure_out_root(str(intent.get("province") or _forecast_fallback_province(req.province)))
+
+        province_name = str(intent.get("province") or _forecast_fallback_province(req.province))
+        from quantaalpha.forecast_agent.data import find_processed_excel
+
+        data_path = await asyncio.to_thread(find_processed_excel, province_name)
+        data_path_display = _display_path_for_ui(data_path)
+        province_label = _province_display_label(province_name)
+        await _emit_stage(
+            "data_loading",
+            f"正在导入{province_label}历史数据（{data_path_display}）",
+            {"province": province_name, "dataPath": data_path_display},
+        )
 
         # --- 阶段 1：xgboost 全特征诊断（与用户最终特征无关，只产出 importance）---
         await _broadcast(task_id, {"type": "progress", "taskId": task_id, "data": _set_progress("analyzing", 30, "运行 xgboost 诊断并提取重要性..."), "timestamp": _now()})
@@ -1618,16 +1709,23 @@ async def _run_forecast_agent(
             context_len=int(req.contextLen or 270),
             candidate_models=(req.candidateModels or ""),
         )
+        selected_model = str(compare.get("best_model") or "")
+        output_display = _display_path_for_ui(str(out_root))
+        forecast_curve: list[dict[str, Any]] = []
+        if selected_model:
+            forecast_curve = _load_forecast_curve_for_ui(out_root / selected_model, selected_model)
+        compare_payload = {
+            "bestModel": compare.get("best_model"),
+            "leaderboard": compare.get("leaderboard", []),
+            "monthlyRollup": compare.get("monthly_rollup", []),
+            "outputDir": output_display,
+            "forecastCurve": forecast_curve,
+        }
         await _emit_stage(
             "compare",
-            "多模型比选已完成，结果如下：",
-            {
-                "bestModel": compare.get("best_model"),
-                "leaderboard": compare.get("leaderboard", []),
-                "monthlyRollup": compare.get("monthly_rollup", []),
-            },
+            f"多模型比选已完成，结果已存入 {output_display}：",
+            compare_payload,
         )
-        selected_model = str(compare.get("best_model") or "")
 
         payload: Dict[str, Any] = {
             "query": req.query,
@@ -1641,7 +1739,11 @@ async def _run_forecast_agent(
                 "feature_superset": recommend.get("feature_superset", []),
                 "reason": recommend.get("reason", ""),
             },
-            "compare": compare,
+            "compare": {
+                **compare,
+                "output_dir_display": output_display,
+                "forecast_curve": forecast_curve,
+            },
             "selected_model": selected_model,
             "output_dir": str(out_root),
         }
@@ -1696,12 +1798,11 @@ async def _run_forecast_agent(
 async def start_forecast_agent(req: ForecastAgentStartRequest):
     """Start single-round forecast agent flow task."""
     task_id = _gen_id()
-    output_dir = req.outputDir or f"forecast_agent_output/{req.province or '河北'}"
     task = {
         "taskId": task_id,
         "status": "running",
         "type": "forecast_agent",
-        "config": {**req.model_dump(), "outputDir": output_dir},
+        "config": {**req.model_dump()},
         "progress": {
             "phase": "parsing",
             "currentRound": 0,
@@ -1718,7 +1819,7 @@ async def start_forecast_agent(req: ForecastAgentStartRequest):
         "updatedAt": _now(),
     }
     tasks[task_id] = task
-    asyncio.create_task(_run_forecast_agent(task_id, req, output_dir))
+    asyncio.create_task(_run_forecast_agent(task_id, req))
     return ApiResponse(
         success=True,
         data={"taskId": task_id, "task": _task_for_api(task)},
@@ -1910,6 +2011,8 @@ def _load_forecast_curve_for_ui(model_dir: Path, model_name: str) -> list[dict[s
         curve: list[dict[str, Any]] = []
         for p in points:
             item: dict[str, Any] = {"ds": p["ds"]}
+            if p.get("period"):
+                item["period"] = p["period"]
             if p.get("yhat") is not None:
                 item["yhat"] = p["yhat"]
             if p.get("y") is not None:
