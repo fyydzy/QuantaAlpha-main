@@ -46,7 +46,7 @@ export const Layout: React.FC<LayoutProps> = ({
     // { id: 'library' as const, label: '因子库', icon: Database },
     // { id: 'backtest' as const, label: '回测', icon: BarChart3 },
     { id: 'weather' as const, label: '天气预测', icon: CloudSun },
-    { id: 'forecast' as const, label: '燃气预测', icon: Flame },
+    { id: 'forecast' as const, label: '今冬明春预测', icon: Flame },
     { id: 'settings' as const, label: '设置', icon: SettingsIcon },
   ];
 
@@ -66,8 +66,8 @@ export const Layout: React.FC<LayoutProps> = ({
                 </div>
               </div>
               <div>
-                <h1 className="text-xl font-bold">QuantaAlpha</h1>
-                <p className="text-xs text-muted-foreground">智能因子挖掘平台</p>
+                <h1 className="text-xl font-bold">天然气市场需求预测</h1>
+                {/* <p className="text-xs text-muted-foreground">旬度销量智能预测</p> */}
               </div>
             </div>
 

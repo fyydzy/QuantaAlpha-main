@@ -1,4 +1,14 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  CartesianGrid,
+  Legend,
+  Line,
+  LineChart,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from 'recharts';
 import { Badge } from '@/components/ui/Badge';
 import { Progress } from '@/components/ui/Progress';
 import {
@@ -99,6 +109,75 @@ const QUICK_REPLIES: Record<string, string[]> = {
   confirm_features: ['好的，继续', '去掉 HDD_squared', '加上 max_temp'],
 };
 
+type ForecastCurvePoint = { ds: string; yhat?: number; y?: number; period?: string };
+
+function ForecastPredActualChart({ data }: { data: ForecastCurvePoint[] }) {
+  if (!Array.isArray(data) || data.length === 0) return null;
+
+  const chartData = data.map((row) => ({
+    ds: row.ds,
+    label: row.period ? `${row.ds} (${row.period})` : row.ds,
+    predicted: row.yhat,
+    actual: row.y,
+  }));
+  const hasActual = chartData.some((row) => row.actual != null && Number.isFinite(row.actual));
+
+  return (
+    <ResponsiveContainer width="100%" height={280}>
+      <LineChart data={chartData} margin={{ top: 8, right: 12, left: 4, bottom: 4 }}>
+        <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border) / 0.5)" />
+        <XAxis
+          dataKey="ds"
+          tick={{ fill: 'hsl(var(--muted-foreground))', fontSize: 10 }}
+          interval="preserveStartEnd"
+          minTickGap={28}
+        />
+        <YAxis
+          tick={{ fill: 'hsl(var(--muted-foreground))', fontSize: 10 }}
+          tickFormatter={(v: number) => (v >= 10000 ? `${(v / 10000).toFixed(1)}万` : String(v))}
+        />
+        <Tooltip
+          contentStyle={{
+            backgroundColor: 'hsl(var(--card))',
+            border: '1px solid hsl(var(--border))',
+            borderRadius: '0.5rem',
+            fontSize: 12,
+          }}
+          labelFormatter={(_, payload) => {
+            const row = payload?.[0]?.payload as { label?: string; ds?: string } | undefined;
+            return row?.label || row?.ds || '';
+          }}
+          formatter={(value: number, name: string) => [
+            Number.isFinite(value) ? value.toLocaleString('zh-CN', { maximumFractionDigits: 0 }) : '-',
+            name,
+          ]}
+        />
+        <Legend wrapperStyle={{ fontSize: 12 }} />
+        <Line
+          type="monotone"
+          dataKey="predicted"
+          name="预测值"
+          stroke="#f97316"
+          strokeWidth={2}
+          dot={{ r: 2 }}
+          connectNulls
+        />
+        {hasActual && (
+          <Line
+            type="monotone"
+            dataKey="actual"
+            name="真实值"
+            stroke="#3b82f6"
+            strokeWidth={2}
+            dot={{ r: 2 }}
+            connectNulls
+          />
+        )}
+      </LineChart>
+    </ResponsiveContainer>
+  );
+}
+
 function StagePayload({ stage, payload }: { stage: string; payload: any }) {
   if (!payload || typeof payload !== 'object') return null;
 
@@ -115,6 +194,14 @@ function StagePayload({ stage, payload }: { stage: string; payload: any }) {
         <div><span className="text-muted-foreground">测试起</span> {data.test_start || '-'}</div>
         <div><span className="text-muted-foreground">测试止</span> {data.test_end || '-'}</div>
         <div className="col-span-2"><span className="text-muted-foreground">截止旬</span> {data.as_of_month || '-'}</div>
+      </div>,
+    );
+  }
+
+  if (stage === 'data_loading') {
+    return panel(
+      <div className="text-xs text-muted-foreground font-mono break-all">
+        {payload.dataPath || '-'}
       </div>,
     );
   }
@@ -155,8 +242,19 @@ function StagePayload({ stage, payload }: { stage: string; payload: any }) {
   if (stage === 'compare') {
     const rows = Array.isArray(payload.leaderboard) ? payload.leaderboard.slice(0, 8) : [];
     const rollup = Array.isArray(payload.monthlyRollup) ? payload.monthlyRollup : [];
+    const outputDir = String(payload.outputDir || payload.output_dir_display || '').trim();
+    const curve: ForecastCurvePoint[] = Array.isArray(payload.forecastCurve)
+      ? payload.forecastCurve
+      : Array.isArray(payload.forecast_curve)
+        ? payload.forecast_curve
+        : [];
     return panel(
       <div className="space-y-3">
+        {outputDir && (
+          <p className="text-xs text-muted-foreground">
+            结果存入 <span className="font-mono text-foreground/80 break-all">{outputDir}</span>
+          </p>
+        )}
         {payload.bestModel && (
           <div className="text-sm">
             最优模型：<span className="font-semibold text-orange-400">{payload.bestModel}</span>
@@ -217,6 +315,12 @@ function StagePayload({ stage, payload }: { stage: string; payload: any }) {
             </div>
           </div>
         )}
+        {curve.length > 0 && (
+          <div>
+            <div className="text-xs text-muted-foreground mb-2">预测值 vs 真实值（测试集旬度）</div>
+            <ForecastPredActualChart data={curve} />
+          </div>
+        )}
       </div>,
     );
   }
@@ -254,7 +358,7 @@ function AssistantBlock({
       </div>
       <div className="flex-1 min-w-0 pt-0.5">
         <div className="flex items-center gap-2 mb-1">
-          <span className="text-xs font-medium text-muted-foreground">燃气预测助手</span>
+          <span className="text-xs font-medium text-muted-foreground">今冬明春预测智能体</span>
           {msg.needConfirm && (
             <Badge variant="outline" className="text-[10px] h-5 px-1.5">
               待你确认
@@ -316,6 +420,18 @@ export const ForecastPage: React.FC = () => {
   useEffect(() => {
     if (completed) setQaMode(true);
   }, [completed, forecastAgentTask?.taskId]);
+
+  useEffect(() => {
+    for (let i = forecastAgentMessages.length - 1; i >= 0; i -= 1) {
+      const msg = forecastAgentMessages[i];
+      if (msg.stage !== 'parse_intent' && msg.stage !== 'intent_applied') continue;
+      const p = String((msg.payload as { province?: string } | undefined)?.province || '').trim();
+      if (p) {
+        setProvince(p);
+        break;
+      }
+    }
+  }, [forecastAgentMessages]);
   const awaiting = (metrics.awaiting_confirmation || null) as any;
   const taskQuery = String((forecastAgentTask?.config as any)?.query || '').trim();
   const progressValue = Number(forecastAgentTask?.progress?.progress || 0);
@@ -479,7 +595,7 @@ export const ForecastPage: React.FC = () => {
           <div>
             <h1 className="text-xl font-bold flex items-center gap-2">
               <Flame className="h-6 w-6 text-orange-500" />
-              燃气预测智能体
+              今冬明春预测智能体
             </h1>
             <p className="text-xs text-muted-foreground mt-0.5">
               自然语言对话 · 意图解析 · 特征推荐 · 多模型比选 · 结果问答
@@ -530,7 +646,7 @@ export const ForecastPage: React.FC = () => {
             </div>
             <div className="flex-1 pt-0.5">
               <p className="text-sm leading-relaxed text-foreground/90">
-                你好，我是燃气销量预测助手。请直接告诉我你想预测哪个省份、哪个月份的销量，我会引导你确认参数和特征，然后自动完成多模型比选。
+                你好，我是今冬明春预测智能体。请直接告诉我你想预测哪个省份、哪个月份的销量，我会引导你确认参数和特征，然后自动完成多模型比选。
               </p>
               <div className="flex flex-wrap gap-2 mt-3">
                 {EXAMPLE_PROMPTS.map((p) => (
@@ -684,7 +800,7 @@ export const ForecastPage: React.FC = () => {
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 mt-3 pt-3 border-t border-border/40">
               <input
                 className="rounded-lg bg-secondary/50 border border-border px-3 py-1.5 text-xs"
-                placeholder="省份"
+                placeholder="兜底省份（对话未提及时）"
                 value={province}
                 onChange={(e) => setProvince(e.target.value)}
                 disabled={running}
