@@ -274,6 +274,10 @@ export interface ForecastAgentContinueParams {
   message?: string;
 }
 
+export interface ForecastAgentResumeParams {
+  checkpoint?: string;
+}
+
 export async function askForecastQa(params: ForecastQaParams) {
   return request<ForecastQaResponse>('/api/v1/forecast/qa', {
     method: 'POST',
@@ -298,6 +302,13 @@ export async function cancelForecastAgent(taskId: string) {
 
 export async function continueForecastAgent(taskId: string, params: ForecastAgentContinueParams) {
   return request<{ task: Task }>(`/api/v1/forecast/agent/${taskId}/continue`, {
+    method: 'POST',
+    body: JSON.stringify(params),
+  });
+}
+
+export async function resumeForecastAgent(taskId: string, params: ForecastAgentResumeParams = {}) {
+  return request<{ task: Task }>(`/api/v1/forecast/agent/${taskId}/resume`, {
     method: 'POST',
     body: JSON.stringify(params),
   });

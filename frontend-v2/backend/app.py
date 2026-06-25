@@ -14,6 +14,7 @@ import re
 import signal
 import subprocess
 import sys
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -32,6 +33,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 DOTENV_PATH = PROJECT_ROOT / ".env"
+
+from quantaalpha.forecast_agent.flow import FlowStage, FlowState, make_checkpoint, write_checkpoint
+from quantaalpha.forecast_agent.tools import audit_path, call_forecast_tool, write_audit_event
 
 # ---------------------------------------------------------------------------
 # FastAPI app
@@ -107,6 +111,14 @@ class ForecastAgentContinueRequest(BaseModel):
     approved: bool = Field(True, description="Whether user approves to continue")
     overrides: Optional[Dict[str, Any]] = Field(None, description="Optional override payload")
     message: Optional[str] = Field(None, description="Optional user message")
+
+
+class ForecastAgentResumeRequest(BaseModel):
+    """Request to resume/retry a stopped forecast agent task."""
+    checkpoint: Optional[str] = Field(
+        None,
+        description="Optional checkpoint stage hint (default uses lastCheckpoint.stage)",
+    )
 
 
 class SystemConfigUpdate(BaseModel):
@@ -1484,12 +1496,7 @@ async def _run_forecast_agent(
         from quantaalpha.forecast_agent.gas_forecast_flow import (
             FIXED_AS_OF_DATE,
             apply_intent_overrides,
-            ask_flow_qa,
-            diagnose_importance,
             normalize_continue_overrides,
-            parse_intent,
-            recommend_feature_superset,
-            run_compare_and_rollup,
         )
 
         if not str(os.getenv("OPENAI_API_KEY", "")).strip():
@@ -1497,6 +1504,62 @@ async def _run_forecast_agent(
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         out_root: Path | None = None
+        flow_audit_file: Path | None = None
+        flow_state = FlowState(task_id=task_id)
+        task["flowState"] = flow_state.to_dict()
+        intent: Dict[str, Any] = {}
+        diagnose: Dict[str, Any] = {}
+        recommend: Dict[str, Any] = {}
+
+        resume_stage = str(task.get("resumeFromStage") or "").strip()
+        resume_state_raw = task.get("resumeState")
+        if not isinstance(resume_state_raw, dict):
+            resume_state_raw = {}
+        if (not resume_state_raw) and isinstance(task.get("lastCheckpoint"), dict):
+            cp_state = task["lastCheckpoint"].get("state")
+            if isinstance(cp_state, dict):
+                resume_state_raw = cp_state
+        if isinstance(resume_state_raw.get("intent"), dict):
+            intent = dict(resume_state_raw["intent"])
+        if isinstance(resume_state_raw.get("diagnose"), dict):
+            diagnose = dict(resume_state_raw["diagnose"])
+        if isinstance(resume_state_raw.get("recommend"), dict):
+            recommend = dict(resume_state_raw["recommend"])
+
+        def _persist_checkpoint(
+            stage: str | FlowStage,
+            *,
+            payload: Dict[str, Any] | None = None,
+            status: str = "running",
+            error: str | None = None,
+        ) -> dict[str, Any]:
+            cp = make_checkpoint(
+                task_id=task_id,
+                stage=stage,
+                status=status,
+                payload=payload,
+                error=error,
+            )
+            cp_state: Dict[str, Any] = {}
+            if isinstance(intent, dict) and intent:
+                cp_state["intent"] = dict(intent)
+            if isinstance(diagnose, dict) and diagnose:
+                cp_state["diagnose"] = dict(diagnose)
+            if isinstance(recommend, dict) and recommend:
+                cp_state["recommend"] = dict(recommend)
+            if cp_state:
+                cp["state"] = cp_state
+            flow_state.stage = str(cp.get("stage") or flow_state.stage)
+            flow_state.status = str(cp.get("status") or flow_state.status)
+            flow_state.updated_at = str(cp.get("timestamp") or _now())
+            flow_state.last_checkpoint = cp
+            task["flowState"] = flow_state.to_dict()
+            task["lastCheckpoint"] = cp
+            if out_root is not None:
+                cp_file = write_checkpoint(out_root, cp)
+                task["checkpointPath"] = str(cp_file)
+                task["checkpointPathDisplay"] = _display_path_for_ui(str(cp_file))
+            return cp
 
         def _sync_task_output_config(intent_province: str, resolved_out_root: Path) -> None:
             if isinstance(task.get("config"), dict):
@@ -1504,7 +1567,7 @@ async def _run_forecast_agent(
                 task["config"]["outputDir"] = str(resolved_out_root)
 
         def _ensure_out_root(intent_province: str) -> Path:
-            nonlocal out_root
+            nonlocal out_root, flow_audit_file
             resolved = _resolve_agent_flow_out_root(
                 intent_province,
                 run_ts=ts,
@@ -1513,7 +1576,119 @@ async def _run_forecast_agent(
             resolved.mkdir(parents=True, exist_ok=True)
             out_root = resolved
             _sync_task_output_config(intent_province, resolved)
+            flow_audit_file = audit_path(out_root)
+            task["auditPath"] = str(flow_audit_file)
+            task["auditPathDisplay"] = _display_path_for_ui(str(flow_audit_file))
+            if isinstance(task.get("lastCheckpoint"), dict):
+                cp_file = write_checkpoint(out_root, task["lastCheckpoint"])
+                task["checkpointPath"] = str(cp_file)
+                task["checkpointPathDisplay"] = _display_path_for_ui(str(cp_file))
             return resolved
+
+        async def _run_tool(
+            stage: str | FlowStage,
+            tool_name: str,
+            *tool_args: Any,
+            input_summary: Any = None,
+            meta: Dict[str, Any] | None = None,
+            **tool_kwargs: Any,
+        ) -> Any:
+            if not isinstance(task.get("metrics"), dict):
+                task["metrics"] = {}
+
+            def _append_tool_event(event: Dict[str, Any]) -> None:
+                events = task["metrics"].get("tool_events")
+                if not isinstance(events, list):
+                    events = []
+                events.append(event)
+                task["metrics"]["tool_events"] = events[-200:]
+                task["metrics"]["tool_event"] = event
+
+            started_ts = _now()
+            t0 = time.perf_counter()
+            try:
+                result = await asyncio.to_thread(
+                    call_forecast_tool,
+                    tool_name,
+                    *tool_args,
+                    **tool_kwargs,
+                )
+                ended_ts = _now()
+                duration_ms = int((time.perf_counter() - t0) * 1000)
+                if out_root is not None:
+                    file_path = write_audit_event(
+                        out_root,
+                        task_id=task_id,
+                        stage=str(stage),
+                        tool=tool_name,
+                        status="ok",
+                        started_at=started_ts,
+                        ended_at=ended_ts,
+                        duration_ms=duration_ms,
+                        input_summary=input_summary,
+                        output_summary=result,
+                        meta=meta or {},
+                    )
+                    task["auditPath"] = str(file_path)
+                    task["auditPathDisplay"] = _display_path_for_ui(str(file_path))
+                tool_event = {
+                    "stage": str(stage),
+                    "tool": tool_name,
+                    "status": "ok",
+                    "startedAt": started_ts,
+                    "endedAt": ended_ts,
+                    "durationMs": duration_ms,
+                }
+                _append_tool_event(tool_event)
+                await _broadcast(
+                    task_id,
+                    {
+                        "type": "metrics",
+                        "taskId": task_id,
+                        "data": {"tool_event": tool_event},
+                        "timestamp": _now(),
+                    },
+                )
+                return result
+            except Exception as exc:
+                ended_ts = _now()
+                duration_ms = int((time.perf_counter() - t0) * 1000)
+                if out_root is not None:
+                    file_path = write_audit_event(
+                        out_root,
+                        task_id=task_id,
+                        stage=str(stage),
+                        tool=tool_name,
+                        status="error",
+                        started_at=started_ts,
+                        ended_at=ended_ts,
+                        duration_ms=duration_ms,
+                        input_summary=input_summary,
+                        error=str(exc),
+                        meta=meta or {},
+                    )
+                    task["auditPath"] = str(file_path)
+                    task["auditPathDisplay"] = _display_path_for_ui(str(file_path))
+                tool_event = {
+                    "stage": str(stage),
+                    "tool": tool_name,
+                    "status": "error",
+                    "startedAt": started_ts,
+                    "endedAt": ended_ts,
+                    "durationMs": duration_ms,
+                    "error": str(exc),
+                }
+                _append_tool_event(tool_event)
+                await _broadcast(
+                    task_id,
+                    {
+                        "type": "metrics",
+                        "taskId": task_id,
+                        "data": {"tool_event": tool_event},
+                        "timestamp": _now(),
+                    },
+                )
+                raise
 
         def _set_progress(phase: str, progress: int, message: str) -> dict[str, Any]:
             task["progress"]["phase"] = phase
@@ -1604,105 +1779,188 @@ async def _run_forecast_agent(
             )
             return cont if isinstance(cont, dict) else {}
 
-        # --- 阶段 0：意图解析 + 确认点①（参数）---
-        await _broadcast(task_id, {"type": "progress", "taskId": task_id, "data": _set_progress("parsing", 10, "解析用户意图..."), "timestamp": _now()})
-        intent = await asyncio.to_thread(
-            parse_intent,
-            req.query,
-            default_province=_forecast_fallback_province(req.province),
-            as_of_month=FIXED_AS_OF_DATE,
-        )
-        await _emit_stage("parse_intent", "我已根据你的描述解析出以下预测参数：", intent)
-        cont_intent = await _wait_for_continue("confirm_intent", {"intent": intent})
-        if cont_intent.get("approved") is False:
-            raise RuntimeError("用户在参数确认阶段取消了任务")
-        intent_overrides = normalize_continue_overrides(
-            "confirm_intent",
-            cont_intent.get("overrides") if isinstance(cont_intent.get("overrides"), dict) else {},
-        )
-        if intent_overrides:
-            intent = apply_intent_overrides(intent, intent_overrides)
-            await _emit_stage("intent_applied", "好的，我已按你的要求更新了预测参数：", intent)
-
-        out_root = _ensure_out_root(str(intent.get("province") or _forecast_fallback_province(req.province)))
-
-        province_name = str(intent.get("province") or _forecast_fallback_province(req.province))
-        from quantaalpha.forecast_agent.data import find_processed_excel
-
-        data_path = await asyncio.to_thread(find_processed_excel, province_name)
-        data_path_display = _display_path_for_ui(data_path)
-        province_label = _province_display_label(province_name)
-        await _emit_stage(
-            "data_loading",
-            f"正在导入{province_label}历史数据（{data_path_display}）",
-            {"province": province_name, "dataPath": data_path_display},
+        resume_to_compare = (
+            bool(resume_stage)
+            and resume_stage
+            in {
+                FlowStage.CONFIRM_FEATURES.value,
+                FlowStage.FEATURES_APPLIED.value,
+                FlowStage.COMPARE.value,
+                FlowStage.QA.value,
+            }
+            and isinstance(intent, dict)
+            and bool(intent)
+            and isinstance(recommend, dict)
+            and isinstance(recommend.get("feature_superset"), list)
+            and len(recommend.get("feature_superset") or []) > 0
         )
 
-        # --- 阶段 1：xgboost 全特征诊断（与用户最终特征无关，只产出 importance）---
-        await _broadcast(task_id, {"type": "progress", "taskId": task_id, "data": _set_progress("analyzing", 30, "运行 xgboost 诊断并提取重要性..."), "timestamp": _now()})
-        diagnose = await asyncio.to_thread(
-            diagnose_importance,
-            intent,
-            output_dir=out_root,
-            context_len=int(req.contextLen or 270),
-        )
-        await _emit_stage(
-            "diagnose",
-            "我已完成 xgboost 特征重要性诊断，以下是 Top 特征：",
-            {
-                "topFeatures": diagnose.get("importance_items", [])[: int(req.importanceTopK or 12)],
-                "testMetrics": diagnose.get("test_metrics", {}),
-            },
-        )
-
-        # --- 阶段 2：LLM 特征推荐 + 确认点②（特征）---
-        await _broadcast(task_id, {"type": "progress", "taskId": task_id, "data": _set_progress("planning", 50, "LLM 推荐特征组合..."), "timestamp": _now()})
-        recommend = await asyncio.to_thread(
-            recommend_feature_superset,
-            query=req.query,
-            intent=intent,
-            importance_items=diagnose.get("importance_items", []),
-            max_feature_count=int(req.maxFeatureCount or 10),
-            top_k=int(req.importanceTopK or 12),
-            required_features=list(req.requiredFeatures or []),
-        )
-        await _emit_stage(
-            "recommend",
-            "结合重要性证据，我为你推荐了以下特征组合：",
-            {
-                "featureSuperset": recommend.get("feature_superset", []),
-                "reason": recommend.get("reason", ""),
-            },
-        )
-        cont_features = await _wait_for_continue(
-            "confirm_features",
-            {
-                "featureSuperset": recommend.get("feature_superset", []),
-                "reason": recommend.get("reason", ""),
-            },
-        )
-        if cont_features.get("approved") is False:
-            raise RuntimeError("用户在特征确认阶段取消了任务")
-        feature_overrides = normalize_continue_overrides(
-            "confirm_features",
-            cont_features.get("overrides") if isinstance(cont_features.get("overrides"), dict) else {},
-        )
-        fs = feature_overrides.get("featureSuperset")
-        if isinstance(fs, list) and fs:
-            recommend["feature_superset"] = fs
-            await _emit_stage(
-                "features_applied",
-                "好的，我已按你的要求更新了特征组合：",
+        if resume_to_compare:
+            out_root = _ensure_out_root(str(intent.get("province") or _forecast_fallback_province(req.province)))
+            await _broadcast(
+                task_id,
                 {
-                    "featureSuperset": recommend["feature_superset"],
-                    "reason": recommend.get("reason", ""),
+                    "type": "progress",
+                    "taskId": task_id,
+                    "data": _set_progress("forecasting", 70, f"从检查点 {resume_stage} 恢复执行..."),
+                    "timestamp": _now(),
+                },
+            )
+            await _emit_stage(
+                "resume",
+                f"已从检查点 {resume_stage} 恢复，继续执行后续阶段。",
+                {"resumeFromStage": resume_stage},
+            )
+            _persist_checkpoint("resume", payload={"resumeFromStage": resume_stage})
+        else:
+            # --- 阶段 0：意图解析 + 确认点①（参数）---
+            await _broadcast(task_id, {"type": "progress", "taskId": task_id, "data": _set_progress("parsing", 10, "解析用户意图..."), "timestamp": _now()})
+            intent = await _run_tool(
+                FlowStage.PARSE_INTENT,
+                "parse_intent",
+                req.query,
+                input_summary={"query": req.query, "defaultProvince": _forecast_fallback_province(req.province)},
+                default_province=_forecast_fallback_province(req.province),
+                as_of_month=FIXED_AS_OF_DATE,
+            )
+            await _emit_stage("parse_intent", "我已根据你的描述解析出以下预测参数：", intent)
+            _persist_checkpoint(FlowStage.PARSE_INTENT, payload={"intent": intent})
+            cont_intent = await _wait_for_continue("confirm_intent", {"intent": intent})
+            _persist_checkpoint(FlowStage.CONFIRM_INTENT, payload={"intent": intent, "continue": cont_intent})
+            if cont_intent.get("approved") is False:
+                raise RuntimeError("用户在参数确认阶段取消了任务")
+            intent_overrides = normalize_continue_overrides(
+                "confirm_intent",
+                cont_intent.get("overrides") if isinstance(cont_intent.get("overrides"), dict) else {},
+            )
+            if intent_overrides:
+                intent = apply_intent_overrides(intent, intent_overrides)
+                await _emit_stage("intent_applied", "好的，我已按你的要求更新了预测参数：", intent)
+                _persist_checkpoint(FlowStage.INTENT_APPLIED, payload={"intent": intent})
+
+            out_root = _ensure_out_root(str(intent.get("province") or _forecast_fallback_province(req.province)))
+
+            province_name = str(intent.get("province") or _forecast_fallback_province(req.province))
+            from quantaalpha.forecast_agent.data import find_processed_excel
+
+            data_path = await asyncio.to_thread(find_processed_excel, province_name)
+            data_path_display = _display_path_for_ui(data_path)
+            province_label = _province_display_label(province_name)
+            await _emit_stage(
+                "data_loading",
+                f"正在导入{province_label}历史数据（{data_path_display}）",
+                {"province": province_name, "dataPath": data_path_display},
+            )
+            _persist_checkpoint(
+                FlowStage.DATA_LOADING,
+                payload={"province": province_name, "dataPath": data_path_display},
+            )
+
+            # --- 阶段 1：xgboost 全特征诊断（与用户最终特征无关，只产出 importance）---
+            await _broadcast(task_id, {"type": "progress", "taskId": task_id, "data": _set_progress("analyzing", 30, "运行 xgboost 诊断并提取重要性..."), "timestamp": _now()})
+            diagnose = await _run_tool(
+                FlowStage.DIAGNOSE,
+                "diagnose_importance",
+                intent,
+                input_summary={"intent": intent, "contextLen": int(req.contextLen or 270)},
+                output_dir=out_root,
+                context_len=int(req.contextLen or 270),
+            )
+            await _emit_stage(
+                "diagnose",
+                "我已完成 xgboost 特征重要性诊断，以下是 Top 特征：",
+                {
+                    "topFeatures": diagnose.get("importance_items", [])[: int(req.importanceTopK or 12)],
+                    "testMetrics": diagnose.get("test_metrics", {}),
+                },
+            )
+            _persist_checkpoint(
+                FlowStage.DIAGNOSE,
+                payload={
+                    "topFeatures": diagnose.get("importance_items", [])[: int(req.importanceTopK or 12)],
+                    "testMetrics": diagnose.get("test_metrics", {}),
                 },
             )
 
+            # --- 阶段 2：LLM 特征推荐 + 确认点②（特征）---
+            await _broadcast(task_id, {"type": "progress", "taskId": task_id, "data": _set_progress("planning", 50, "LLM 推荐特征组合..."), "timestamp": _now()})
+            recommend = await _run_tool(
+                FlowStage.RECOMMEND,
+                "recommend_feature_superset",
+                input_summary={
+                    "query": req.query,
+                    "intent": intent,
+                    "maxFeatureCount": int(req.maxFeatureCount or 10),
+                    "importanceTopK": int(req.importanceTopK or 12),
+                },
+                query=req.query,
+                intent=intent,
+                importance_items=diagnose.get("importance_items", []),
+                max_feature_count=int(req.maxFeatureCount or 10),
+                top_k=int(req.importanceTopK or 12),
+                required_features=list(req.requiredFeatures or []),
+            )
+            await _emit_stage(
+                "recommend",
+                "结合重要性证据，我为你推荐了以下特征组合：",
+                {
+                    "featureSuperset": recommend.get("feature_superset", []),
+                    "reason": recommend.get("reason", ""),
+                },
+            )
+            _persist_checkpoint(
+                FlowStage.RECOMMEND,
+                payload={
+                    "featureSuperset": recommend.get("feature_superset", []),
+                    "reason": recommend.get("reason", ""),
+                },
+            )
+            cont_features = await _wait_for_continue(
+                "confirm_features",
+                {
+                    "featureSuperset": recommend.get("feature_superset", []),
+                    "reason": recommend.get("reason", ""),
+                },
+            )
+            _persist_checkpoint(
+                FlowStage.CONFIRM_FEATURES,
+                payload={
+                    "featureSuperset": recommend.get("feature_superset", []),
+                    "continue": cont_features,
+                },
+            )
+            if cont_features.get("approved") is False:
+                raise RuntimeError("用户在特征确认阶段取消了任务")
+            feature_overrides = normalize_continue_overrides(
+                "confirm_features",
+                cont_features.get("overrides") if isinstance(cont_features.get("overrides"), dict) else {},
+            )
+            fs = feature_overrides.get("featureSuperset")
+            if isinstance(fs, list) and fs:
+                recommend["feature_superset"] = fs
+                await _emit_stage(
+                    "features_applied",
+                    "好的，我已按你的要求更新了特征组合：",
+                    {
+                        "featureSuperset": recommend["feature_superset"],
+                        "reason": recommend.get("reason", ""),
+                    },
+                )
+                _persist_checkpoint(
+                    FlowStage.FEATURES_APPLIED,
+                    payload={"featureSuperset": recommend.get("feature_superset", [])},
+                )
+
         # --- 阶段 3：多模型比选 + 月度汇总（无第三个人机确认点）---
         await _broadcast(task_id, {"type": "progress", "taskId": task_id, "data": _set_progress("forecasting", 75, "执行多模型比选与预测..."), "timestamp": _now()})
-        compare = await asyncio.to_thread(
-            run_compare_and_rollup,
+        compare = await _run_tool(
+            FlowStage.COMPARE,
+            "run_compare_and_rollup",
+            input_summary={
+                "intent": intent,
+                "featureSuperset": list(recommend.get("feature_superset") or []),
+                "candidateModels": (req.candidateModels or ""),
+            },
             intent=intent,
             feature_superset=list(recommend.get("feature_superset") or []),
             output_dir=out_root,
@@ -1726,6 +1984,7 @@ async def _run_forecast_agent(
             f"多模型比选已完成，结果已存入 {output_display}：",
             compare_payload,
         )
+        _persist_checkpoint(FlowStage.COMPARE, payload=compare_payload)
 
         payload: Dict[str, Any] = {
             "query": req.query,
@@ -1751,8 +2010,10 @@ async def _run_forecast_agent(
         # --- 阶段 4（可选）：启动时预填 qaQuery 则自动问答一次；完成后多轮追问走 POST /forecast/qa ---
         if req.qaQuery and str(req.qaQuery).strip() and selected_model:
             await _broadcast(task_id, {"type": "progress", "taskId": task_id, "data": _set_progress("qa", 90, "生成问答结果..."), "timestamp": _now()})
-            qa = await asyncio.to_thread(
-                ask_flow_qa,
+            qa = await _run_tool(
+                FlowStage.QA,
+                "ask_flow_qa",
+                input_summary={"model": selected_model, "query": str(req.qaQuery)},
                 output_dir=out_root,
                 model=selected_model,
                 query=str(req.qaQuery),
@@ -1760,6 +2021,7 @@ async def _run_forecast_agent(
             )
             payload["qa"] = qa
             await _emit_stage("qa", "已完成结果问答。", qa)
+            _persist_checkpoint(FlowStage.QA, payload=qa)
 
         result_json = out_root / "agent_flow_result.json"
         result_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1767,6 +2029,16 @@ async def _run_forecast_agent(
         task["metrics"] = payload
         task["status"] = "completed"
         task["updatedAt"] = _now()
+        task["resumeFromStage"] = None
+        task["resumeState"] = None
+        _persist_checkpoint(
+            FlowStage.COMPLETED,
+            payload={
+                "selected_model": selected_model,
+                "output_dir": str(out_root) if out_root is not None else "",
+            },
+            status="completed",
+        )
         await _broadcast(task_id, {"type": "progress", "taskId": task_id, "data": _set_progress("completed", 100, "预测智能体流程完成"), "timestamp": _now()})
         await _broadcast(
             task_id,
@@ -1783,6 +2055,13 @@ async def _run_forecast_agent(
         task["status"] = "failed"
         task["progress"]["message"] = str(e)
         task["updatedAt"] = _now()
+        task["resumeState"] = None
+        _persist_checkpoint(
+            FlowStage.FAILED,
+            payload={"message": str(e)},
+            status="failed",
+            error=str(e),
+        )
         await _broadcast(
             task_id,
             {
@@ -1815,6 +2094,15 @@ async def start_forecast_agent(req: ForecastAgentStartRequest):
         "metrics": {},
         "result": None,
         "pid": None,
+        "flowState": FlowState(task_id=task_id).to_dict(),
+        "lastCheckpoint": None,
+        "checkpointPath": None,
+        "checkpointPathDisplay": None,
+        "auditPath": None,
+        "auditPathDisplay": None,
+        "resumeFromStage": None,
+        "resumeState": None,
+        "resumedAt": None,
         "createdAt": _now(),
         "updatedAt": _now(),
     }
@@ -1854,6 +2142,61 @@ async def cancel_forecast_agent(task_id: str):
     return ApiResponse(success=True, message="预测智能体任务已取消")
 
 
+@app.post("/api/v1/forecast/agent/{task_id}/resume", response_model=ApiResponse)
+async def resume_forecast_agent(task_id: str, req: ForecastAgentResumeRequest):
+    """Resume/retry an existing forecast agent task using stored config."""
+    if task_id not in tasks:
+        raise HTTPException(status_code=404, detail="Task not found")
+    task = tasks[task_id]
+    if task.get("status") == "running":
+        raise HTTPException(status_code=409, detail="任务正在运行，无法恢复")
+    if str(task.get("type") or "") != "forecast_agent":
+        raise HTTPException(status_code=400, detail="仅支持恢复 forecast_agent 任务")
+
+    cfg = task.get("config")
+    if not isinstance(cfg, dict):
+        raise HTTPException(status_code=400, detail="任务缺少可恢复的配置")
+    try:
+        start_req = ForecastAgentStartRequest(**cfg)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"任务配置无效，无法恢复: {exc}") from exc
+
+    last_cp = task.get("lastCheckpoint") if isinstance(task.get("lastCheckpoint"), dict) else {}
+    checkpoint = str(req.checkpoint or last_cp.get("stage") or "").strip() or None
+    resume_state = last_cp.get("state") if isinstance(last_cp.get("state"), dict) else {}
+
+    _forecast_continue_payloads.pop(task_id, None)
+    cont_event = _forecast_continue_events.pop(task_id, None)
+    if isinstance(cont_event, asyncio.Event):
+        cont_event.set()
+
+    task["status"] = "running"
+    task["progress"] = {
+        "phase": "parsing",
+        "currentRound": 0,
+        "totalRounds": 1,
+        "progress": 0,
+        "message": "正在从检查点恢复预测智能体...",
+        "timestamp": _now(),
+    }
+    task["logs"] = []
+    task["metrics"] = {}
+    task["result"] = None
+    task["pid"] = None
+    task["flowState"] = FlowState(task_id=task_id).to_dict()
+    task["resumeFromStage"] = checkpoint
+    task["resumeState"] = resume_state
+    task["resumedAt"] = _now()
+    task["updatedAt"] = _now()
+
+    asyncio.create_task(_run_forecast_agent(task_id, start_req))
+    return ApiResponse(
+        success=True,
+        data={"task": _task_for_api(task)},
+        message="预测智能体任务已恢复",
+    )
+
+
 @app.post("/api/v1/forecast/agent/{task_id}/continue", response_model=ApiResponse)
 async def continue_forecast_agent(task_id: str, req: ForecastAgentContinueRequest):
     """用户在人机确认点的回复入口。
@@ -1874,6 +2217,9 @@ async def continue_forecast_agent(task_id: str, req: ForecastAgentContinueReques
         )
     user_message = str(req.message or "").strip()
     checkpoint = str(awaiting.get("checkpoint") or "")
+    normalized_req_overrides = req.overrides if isinstance(req.overrides, dict) else {}
+    if not user_message and not normalized_req_overrides:
+        raise HTTPException(status_code=400, detail="继续确认内容不能为空，请输入回复或传入 overrides")
     from quantaalpha.forecast_agent.gas_forecast_flow import parse_continue_message
 
     try:
@@ -1881,7 +2227,7 @@ async def continue_forecast_agent(task_id: str, req: ForecastAgentContinueReques
             checkpoint,
             awaiting.get("payload") or {},
             user_message,
-            req_overrides=req.overrides,
+            req_overrides=normalized_req_overrides,
             req_approved=bool(req.approved),
         )
     except ValueError as exc:

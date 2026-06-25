@@ -26,12 +26,14 @@ import {
   getForecastAgentStatus,
   cancelForecastAgent as apiCancelForecastAgent,
   continueForecastAgent as apiContinueForecastAgent,
+  resumeForecastAgent as apiResumeForecastAgent,
   connectMiningWs,
   healthCheck,
 } from '@/services/api';
 import type {
   BacktestStartParams,
   ForecastAgentContinueParams,
+  ForecastAgentResumeParams,
   ForecastAgentStartParams,
 } from '@/services/api';
 import { getDefaultMiningDirection } from '@/utils/miningDirections';
@@ -91,6 +93,7 @@ interface TaskContextValue {
   forecastAgentMessages: ForecastAgentMessage[];
   startForecastAgentTask: (params: ForecastAgentStartParams) => Promise<void>;
   continueForecastAgentTask: (params: ForecastAgentContinueParams) => Promise<void>;
+  resumeForecastAgentTask: (params?: ForecastAgentResumeParams) => Promise<void>;
   stopForecastAgentTask: () => void;
 }
 
@@ -760,6 +763,73 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
     [forecastAgentTask],
   );
 
+  const resumeForecastAgentTask = useCallback(
+    async (params: ForecastAgentResumeParams = {}) => {
+      if (!forecastAgentTask) return;
+
+      forecastAgentWsRef.current?.close();
+      forecastAgentWsRef.current = null;
+      if (forecastAgentPollingRef.current) {
+        clearInterval(forecastAgentPollingRef.current);
+        forecastAgentPollingRef.current = null;
+      }
+
+      const resp = await apiResumeForecastAgent(forecastAgentTask.taskId, params);
+      if (!resp.success || !resp.data?.task) {
+        throw new Error(resp.error || 'Failed to resume');
+      }
+
+      const taskData = resp.data.task as unknown as BacktestTask;
+      setForecastAgentTask(taskData);
+      setForecastAgentLogs([]);
+      setForecastAgentMessages([]);
+
+      const ws = connectMiningWs(
+        forecastAgentTask.taskId,
+        handleForecastAgentWsMessage,
+        () => {
+          getForecastAgentStatus(forecastAgentTask.taskId).then((r) => {
+            if (r.data?.task) setForecastAgentTask(r.data.task as unknown as BacktestTask);
+          });
+        },
+      );
+      forecastAgentWsRef.current = ws;
+
+      forecastAgentPollingRef.current = setInterval(async () => {
+        try {
+          const r = await getForecastAgentStatus(forecastAgentTask.taskId);
+          if (r.data?.task) {
+            const t = r.data.task as unknown as BacktestTask;
+            setForecastAgentTask((prev) => {
+              if (!prev) return t;
+              return {
+                ...prev,
+                status: t.status,
+                progress: t.progress || prev.progress,
+                metrics: t.metrics && Object.keys(t.metrics).length > 0 ? t.metrics : prev.metrics,
+                updatedAt: t.updatedAt,
+              };
+            });
+            if (t.status === 'completed' || t.status === 'failed' || t.status === 'cancelled') {
+              setForecastAgentTask(t);
+              if (t.logs?.length) setForecastAgentLogs(t.logs.slice(-500));
+              const finalMessages =
+                ((t.metrics as any)?.agent_messages as ForecastAgentMessage[] | undefined) || [];
+              if (finalMessages.length > 0) {
+                setForecastAgentMessages(finalMessages);
+              }
+              clearInterval(forecastAgentPollingRef.current!);
+              forecastAgentPollingRef.current = null;
+            }
+          }
+        } catch {
+          // ignore
+        }
+      }, 5000);
+    },
+    [forecastAgentTask, handleForecastAgentWsMessage],
+  );
+
   // ==================================================================
   // Context value
   // ==================================================================
@@ -785,6 +855,7 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
     forecastAgentMessages,
     startForecastAgentTask,
     continueForecastAgentTask,
+    resumeForecastAgentTask,
     stopForecastAgentTask,
   };
 

@@ -4,7 +4,7 @@ import json
 import os
 from typing import Any
 
-from quantaalpha.llm.client import APIBackend
+from quantaalpha.forecast_agent.llm.client_flow import create_chat_completion_with_retry
 from quantaalpha.llm.config import LLM_SETTINGS
 
 
@@ -95,10 +95,12 @@ def generate_forecast_qa_answer(
         ],
     }
 
-    backend = APIBackend(chat_api_key=api_key or None)
-    answer = backend.build_messages_and_create_chat_completion(
+    answer = create_chat_completion_with_retry(
         user_prompt=json.dumps(user_payload, ensure_ascii=False),
         system_prompt=system_prompt,
+        chat_api_key=api_key or None,
+        scene="forecast_qa",
+        json_mode=False,
         reasoning_flag=False,
         temperature=0.2,
         max_tokens=1200,
@@ -106,7 +108,7 @@ def generate_forecast_qa_answer(
 
     return {
         "answer": (answer or "").strip(),
-        "model_used": getattr(backend, "chat_model", "") or str(LLM_SETTINGS.chat_model),
+        "model_used": str(LLM_SETTINGS.chat_model),
         "rows_used": len(limited_rows),
         "data_mode": data_mode,
         "feature_cols_used": feature_cols_used,
