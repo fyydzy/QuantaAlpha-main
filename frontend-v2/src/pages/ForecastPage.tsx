@@ -210,7 +210,7 @@ function StagePayload({
       </div>,
     );
 
-  if (stage === 'parse_intent' || stage === 'intent_applied' || stage === 'confirm_intent') {
+  if (stage === 'parse_intent' || stage === 'intent_applied' || stage === 'confirm_intent' || stage === 'resume') {
     const data = payload.intent || payload;
     return panelWithTool(
       <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-xs">
@@ -420,7 +420,6 @@ export const ForecastPage: React.FC = () => {
     forecastAgentMessages,
     startForecastAgentTask,
     continueForecastAgentTask,
-    resumeForecastAgentTask,
     stopForecastAgentTask,
   } = useTaskContext();
 
@@ -439,7 +438,6 @@ export const ForecastPage: React.FC = () => {
 
   const running = forecastAgentTask?.status === 'running';
   const completed = forecastAgentTask?.status === 'completed';
-  const failed = forecastAgentTask?.status === 'failed' || forecastAgentTask?.status === 'cancelled';
   const metrics = forecastAgentTask?.metrics || {};
   const qaContext = useMemo(() => getForecastQaContext(metrics), [metrics]);
   const canAskQa = completed && qaMode && !!qaContext.outputDir && !!qaContext.model;
@@ -449,13 +447,18 @@ export const ForecastPage: React.FC = () => {
   }, [completed, forecastAgentTask?.taskId]);
 
   useEffect(() => {
-    for (let i = forecastAgentMessages.length - 1; i >= 0; i -= 1) {
-      const msg = forecastAgentMessages[i];
-      if (msg.stage !== 'parse_intent' && msg.stage !== 'intent_applied') continue;
-      const p = String((msg.payload as { province?: string } | undefined)?.province || '').trim();
-      if (p) {
-        setProvince(p);
-        break;
+    const preferredStages = ['intent_applied', 'parse_intent'];
+    for (const preferred of preferredStages) {
+      for (let i = forecastAgentMessages.length - 1; i >= 0; i -= 1) {
+        const msg = forecastAgentMessages[i];
+        if (msg.stage !== preferred) continue;
+        const data = ((msg.payload as { intent?: { province?: string }; province?: string } | undefined)?.intent
+          || msg.payload) as { province?: string } | undefined;
+        const p = String(data?.province || '').trim();
+        if (p) {
+          setProvince(p);
+          return;
+        }
       }
     }
   }, [forecastAgentMessages]);
@@ -465,8 +468,6 @@ export const ForecastPage: React.FC = () => {
   const progressMessage = String(forecastAgentTask?.progress?.message || '');
 
   const awaitingCheckpoint = awaiting?.checkpoint as string | undefined;
-  const resumeCheckpoint = String((forecastAgentTask as any)?.lastCheckpoint?.stage || '').trim();
-  const canResume = failed && !!forecastAgentTask && !!resumeCheckpoint;
   const canReply = running && !!awaitingCheckpoint;
   const isBusy = submitting || (running && !canReply);
   const toolEvents = Array.isArray((metrics as any).tool_events) ? ((metrics as any).tool_events as any[]) : [];
@@ -601,21 +602,6 @@ export const ForecastPage: React.FC = () => {
     setQaMode(false);
   }, []);
 
-  const handleResume = useCallback(async () => {
-    if (!canResume) return;
-    setSubmitting(true);
-    try {
-      await resumeForecastAgentTask({ checkpoint: resumeCheckpoint });
-      setInput('');
-      setFollowUpMessages([]);
-      setQaMode(true);
-    } catch (err) {
-      console.error('Failed to resume forecast agent:', err);
-    } finally {
-      setSubmitting(false);
-    }
-  }, [canResume, resumeCheckpoint, resumeForecastAgentTask]);
-
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
@@ -666,16 +652,6 @@ export const ForecastPage: React.FC = () => {
                 新预测
               </button>
             )}
-            {canResume && (
-              <button
-                type="button"
-                onClick={() => void handleResume()}
-                disabled={submitting}
-                className="text-xs px-3 py-1.5 rounded-lg border border-amber-500/40 bg-amber-500/10 hover:bg-amber-500/20 transition-colors disabled:opacity-50"
-              >
-                从检查点恢复
-              </button>
-            )}
             {forecastAgentTask?.status && (
               <Badge variant={forecastAgentTask.status === 'completed' ? 'default' : 'outline'}>
                 {forecastAgentTask.status}
@@ -702,10 +678,6 @@ export const ForecastPage: React.FC = () => {
         )}
         {forecastAgentTask && (
           <div className="mt-2 text-[11px] text-muted-foreground flex flex-wrap gap-x-3 gap-y-1">
-            {resumeCheckpoint && <span>最近检查点：{resumeCheckpoint}</span>}
-            {(forecastAgentTask as any).checkpointPathDisplay && (
-              <span>checkpoint：{String((forecastAgentTask as any).checkpointPathDisplay)}</span>
-            )}
             {(forecastAgentTask as any).auditPathDisplay && (
               <span>audit：{String((forecastAgentTask as any).auditPathDisplay)}</span>
             )}

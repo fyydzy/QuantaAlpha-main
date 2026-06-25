@@ -1,60 +1,22 @@
 /**
- * TaskContext — Global Task State Management
- *
- * Lifts mining and backtest task state, WebSocket connection, and polling logic
- * to App level, so running state is not lost when switching pages.
+ * TaskContext — 预测智能体任务状态（WebSocket + 轮询）。
  */
 
 import React, { createContext, useContext, useState, useCallback, useRef, useEffect } from 'react';
-import type {
-  Task,
-  TaskConfig,
-  LogEntry,
-  RealtimeMetrics,
-  TimeSeriesData,
-  WsMessage,
-} from '@/types';
+import type { LogEntry, WsMessage } from '@/types';
 import { generateId } from '@/utils';
 import {
-  startMining as apiStartMining,
-  getMiningStatus,
-  cancelMining as apiCancelMining,
-  startBacktest as apiStartBacktest,
-  getBacktestStatus,
-  cancelBacktest as apiCancelBacktest,
   startForecastAgent as apiStartForecastAgent,
   getForecastAgentStatus,
   cancelForecastAgent as apiCancelForecastAgent,
   continueForecastAgent as apiContinueForecastAgent,
-  resumeForecastAgent as apiResumeForecastAgent,
-  connectMiningWs,
+  connectTaskWs,
   healthCheck,
 } from '@/services/api';
 import type {
-  BacktestStartParams,
   ForecastAgentContinueParams,
-  ForecastAgentResumeParams,
   ForecastAgentStartParams,
 } from '@/services/api';
-import { getDefaultMiningDirection } from '@/utils/miningDirections';
-
-// ========================== Backtest local type ==========================
-
-export interface BacktestTask {
-  taskId: string;
-  status: string;
-  progress: {
-    phase: string;
-    progress: number;
-    message: string;
-    timestamp: string;
-  };
-  logs: LogEntry[];
-  metrics: Record<string, any>;
-  config: Record<string, any>;
-  createdAt: string;
-  updatedAt: string;
-}
 
 export interface ForecastAgentMessage {
   role: string;
@@ -66,551 +28,52 @@ export interface ForecastAgentMessage {
   timestamp: string;
 }
 
-// ========================== Context Value ==========================
+export interface ForecastAgentTaskState {
+  taskId: string;
+  status: string;
+  progress: {
+    phase: string;
+    progress: number;
+    message: string;
+    timestamp: string;
+    currentRound?: number;
+    totalRounds?: number;
+  };
+  logs: LogEntry[];
+  metrics: Record<string, any>;
+  config: Record<string, any>;
+  createdAt: string;
+  updatedAt: string;
+  lastCheckpoint?: Record<string, any>;
+  checkpointPathDisplay?: string;
+  auditPathDisplay?: string;
+}
 
 interface TaskContextValue {
-  // Backend health
   backendAvailable: boolean | null;
-
-  // ---- Mining ----
-  miningTask: Task | null;
-  miningEquityCurve: TimeSeriesData[];
-  miningDrawdownCurve: TimeSeriesData[];
-  miningIcTimeSeries: TimeSeriesData[];
-  startMining: (config: TaskConfig) => void;
-  stopMining: () => void;
-  resetMiningTask: () => void;
-
-  // ---- Backtest ----
-  backtestTask: BacktestTask | null;
-  backtestLogs: LogEntry[];
-  startBacktestTask: (params: BacktestStartParams) => Promise<void>;
-  stopBacktestTask: () => void;
-
-  // ---- Forecast Agent ----
-  forecastAgentTask: BacktestTask | null;
+  forecastAgentTask: ForecastAgentTaskState | null;
   forecastAgentLogs: LogEntry[];
   forecastAgentMessages: ForecastAgentMessage[];
   startForecastAgentTask: (params: ForecastAgentStartParams) => Promise<void>;
   continueForecastAgentTask: (params: ForecastAgentContinueParams) => Promise<void>;
-  resumeForecastAgentTask: (params?: ForecastAgentResumeParams) => Promise<void>;
   stopForecastAgentTask: () => void;
 }
 
 const TaskContext = createContext<TaskContextValue | null>(null);
 
-// ========================== Provider ==========================
-
 export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  // ---- Backend health ----
   const [backendAvailable, setBackendAvailable] = useState<boolean | null>(null);
+  const [forecastAgentTask, setForecastAgentTask] = useState<ForecastAgentTaskState | null>(null);
+  const [forecastAgentLogs, setForecastAgentLogs] = useState<LogEntry[]>([]);
+  const [forecastAgentMessages, setForecastAgentMessages] = useState<ForecastAgentMessage[]>([]);
+  const forecastAgentWsRef = useRef<WebSocket | null>(null);
+  const forecastAgentPollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
     healthCheck()
       .then(() => setBackendAvailable(true))
       .catch(() => setBackendAvailable(false));
   }, []);
-
-  // ==================================================================
-  // MINING
-  // ==================================================================
-  const [miningTask, setMiningTask] = useState<Task | null>(null);
-  const [miningEquityCurve, setMiningEquityCurve] = useState<TimeSeriesData[]>([]);
-  const [miningDrawdownCurve, setMiningDrawdownCurve] = useState<TimeSeriesData[]>([]);
-  const [miningIcTimeSeries, setMiningIcTimeSeries] = useState<TimeSeriesData[]>([]);
-
-  const miningWsRef = useRef<WebSocket | null>(null);
-  const miningPollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const miningDataPointsRef = useRef(0);
-
-  // Chart data helper
-  const pushMiningDataPoint = useCallback(() => {
-    miningDataPointsRef.current += 1;
-    const n = miningDataPointsRef.current;
-    const startDate = new Date('2020-01-01');
-    const d = new Date(startDate);
-    d.setDate(d.getDate() + n * 7);
-    const dateStr = d.toISOString().split('T')[0];
-
-    setMiningEquityCurve((prev) => [
-      ...prev,
-      { date: dateStr, value: 1 + n * 0.003 + (Math.random() - 0.5) * 0.02 },
-    ]);
-    setMiningDrawdownCurve((prev) => [
-      ...prev,
-      { date: dateStr, value: -0.02 - n * 0.001 + (Math.random() - 0.5) * 0.01 },
-    ]);
-    setMiningIcTimeSeries((prev) => [
-      ...prev,
-      { date: dateStr, value: 0.05 + Math.sin(n * 0.1) * 0.02 + (Math.random() - 0.5) * 0.01 },
-    ]);
-  }, []);
-
-  // WS handler for mining
-  const handleMiningWsMessage = useCallback(
-    (msg: WsMessage) => {
-      setMiningTask((prev) => {
-        if (!prev) return prev;
-        const updated = { ...prev };
-        switch (msg.type) {
-          case 'progress':
-            updated.progress = msg.data;
-            updated.status = msg.data.phase === 'completed' ? 'completed' : 'running';
-            if (['backtesting', 'analyzing', 'completed'].includes(msg.data.phase)) {
-              pushMiningDataPoint();
-            }
-            break;
-          case 'log':
-            // Increased frontend log retention limit from 99 to 2000
-            updated.logs = [...(updated.logs || []).slice(-2000), msg.data as LogEntry];
-            
-            // Try to extract factor from log message to show it immediately in the list
-            // Pattern: "Added new factor: {name} with expression: {expr}"
-            const logMsg = (msg.data as LogEntry).message;
-            if (logMsg && logMsg.includes("Added new factor:")) {
-              const match = logMsg.match(/Added new factor: (.+?) with expression: (.+)/);
-              if (match) {
-                const [_, name, expr] = match;
-                const currentMetrics = updated.metrics || {
-                    ic: 0, icir: 0, rankIc: 0, rankIcir: 0,
-                    annualReturn: 0, sharpeRatio: 0, maxDrawdown: 0,
-                    totalFactors: 0, highQualityFactors: 0, mediumQualityFactors: 0, lowQualityFactors: 0,
-                    top10Factors: []
-                };
-                
-                const currentFactors = currentMetrics.top10Factors || [];
-                // Avoid duplicates
-                if (!currentFactors.some((f: any) => f.factorName === name)) {
-                    const newFactor = {
-                        factorName: name,
-                        factorExpression: expr,
-                        rankIc: 0, rankIcir: 0, ic: 0, icir: 0,
-                        annualReturn: 0, sharpeRatio: 0, maxDrawdown: 0, calmarRatio: 0,
-                        cumulativeCurve: []
-                    };
-                    
-                    // Recalculate best metrics from the updated list
-                    const updatedFactors = [newFactor, ...currentFactors];
-                    const bestFactor = updatedFactors.reduce((best, current) => {
-                        // Prioritize RankIC, but handle potential missing values
-                        const bestScore = best.rankIc || 0;
-                        const currentScore = current.rankIc || 0;
-                        return currentScore > bestScore ? current : best;
-                    }, updatedFactors[0]);
-
-                    updated.metrics = {
-                        ...currentMetrics,
-                        totalFactors: (currentMetrics.totalFactors || 0) + 1,
-                        // Prepend new factor to the list so user sees it immediately
-                        top10Factors: updatedFactors,
-                        // Update best factor metrics
-                        factorName: bestFactor.factorName,
-                        rankIc: bestFactor.rankIc ?? 0,
-                        rankIcir: bestFactor.rankIcir ?? 0,
-                        ic: bestFactor.ic ?? 0,
-                        icir: bestFactor.icir ?? 0,
-                        annualReturn: bestFactor.annualReturn ?? 0,
-                        sharpeRatio: bestFactor.sharpeRatio ?? 0,
-                        maxDrawdown: bestFactor.maxDrawdown ?? 0,
-                    };
-                }
-              }
-            }
-            break;
-          case 'metrics':
-            updated.metrics = {
-              ...(updated.metrics || {} as RealtimeMetrics),
-              ...msg.data as RealtimeMetrics
-            };
-            break;
-          case 'result':
-            updated.status = msg.data.status === 'completed' ? 'completed' : 'failed';
-            if (msg.data.metrics) updated.metrics = msg.data.metrics;
-            break;
-          case 'error':
-            updated.status = 'failed';
-            updated.logs = [
-              ...(updated.logs || []),
-              {
-                id: generateId(),
-                timestamp: new Date().toISOString(),
-                level: 'error',
-                message: msg.data.error || 'Unknown error',
-              },
-            ];
-            break;
-        }
-        updated.updatedAt = new Date().toISOString();
-        return updated;
-      });
-    },
-    [pushMiningDataPoint],
-  );
-
-  // Start mining (real backend)
-  const startRealMining = useCallback(
-    async (config: TaskConfig) => {
-      try {
-        // Load defaults from localStorage
-        let defaults: any = {};
-        const savedConfig = localStorage.getItem('quantaalpha_config');
-        if (savedConfig) {
-          try {
-            defaults = JSON.parse(savedConfig);
-          } catch {}
-        }
-
-        const direction =
-          config.useCustomMiningDirection
-            ? (getDefaultMiningDirection() || '价量因子挖掘')
-            : (config.userInput && config.userInput.trim()) || getDefaultMiningDirection() || '价量因子挖掘';
-        const resp = await apiStartMining({
-          direction,
-          numDirections: config.numDirections || defaults.defaultNumDirections || 2,
-          maxRounds: config.maxRounds || defaults.defaultMaxRounds || 3,
-          librarySuffix: config.librarySuffix || defaults.defaultLibrarySuffix || undefined,
-          qualityGateEnabled: config.qualityGateEnabled ?? defaults.qualityGateEnabled ?? true,
-          parallelEnabled: config.parallelExecution ?? defaults.parallelExecution ?? false,
-        });
-        if (!resp.success || !resp.data) throw new Error(resp.error || 'Failed');
-
-        const taskData = resp.data.task as Task;
-        // Initialize metrics with empty top10Factors to avoid stale data
-        if (taskData.metrics) {
-            taskData.metrics.top10Factors = [];
-            taskData.metrics.totalFactors = 0;
-            taskData.metrics.highQualityFactors = 0;
-            taskData.metrics.mediumQualityFactors = 0;
-            taskData.metrics.lowQualityFactors = 0;
-        }
-        setMiningTask(taskData);
-        setMiningEquityCurve([]);
-        setMiningDrawdownCurve([]);
-        setMiningIcTimeSeries([]);
-        miningDataPointsRef.current = 0;
-
-        // WebSocket
-        const ws = connectMiningWs(
-          resp.data.taskId,
-          handleMiningWsMessage,
-          () => {
-            getMiningStatus(resp.data!.taskId).then((r) => {
-              if (r.data?.task) setMiningTask(r.data.task as Task);
-            });
-          },
-        );
-        miningWsRef.current = ws;
-
-        // Polling fallback
-        miningPollingRef.current = setInterval(async () => {
-          try {
-            const r = await getMiningStatus(resp.data!.taskId);
-            if (r.data?.task) {
-              const t = r.data.task as Task;
-              if (t.status === 'completed' || t.status === 'failed') {
-                setMiningTask(t);
-                clearInterval(miningPollingRef.current!);
-                miningPollingRef.current = null;
-              }
-            }
-          } catch {
-            // ignore
-          }
-        }, 10000);
-      } catch (err: any) {
-        console.error('Failed to start mining task:', err);
-        // Fall back to mock
-        startMockMining(config);
-      }
-    },
-    [handleMiningWsMessage],
-  );
-
-  // Mock mining fallback
-  const startMockMining = useCallback(
-    (config: TaskConfig) => {
-      const newTask: Task = {
-        taskId: generateId(),
-        status: 'running',
-        config,
-        progress: {
-          phase: 'parsing',
-          currentRound: 0,
-          totalRounds: config.maxRounds || 7,
-          progress: 0,
-          message: '正在解析用户需求...',
-          timestamp: new Date().toISOString(),
-        },
-        logs: [],
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      };
-      setMiningTask(newTask);
-      setMiningEquityCurve([]);
-      setMiningDrawdownCurve([]);
-      setMiningIcTimeSeries([]);
-      miningDataPointsRef.current = 0;
-
-      const phases = ['parsing', 'planning', 'evolving', 'backtesting', 'analyzing', 'completed'] as const;
-      let phaseIdx = 0;
-      let progress = 0;
-      let round = 1;
-
-      const logMessages: Record<string, string[]> = {
-        parsing: ['解析需求关键词...', '识别策略类型...', '生成研究方向...'],
-        planning: ['规划探索路径...', '初始化进化框架...', '准备种子因子...'],
-        evolving: ['生成因子假设...', '构建表达式...', '计算因子值...', '评估质量...'],
-        backtesting: ['执行回测计算...', '计算IC指标...', '评估收益曲线...', '分析因子质量...'],
-        analyzing: ['综合分析结果...', '生成评估报告...', '优化因子组合...'],
-        completed: ['任务完成!', '结果已生成!'],
-      };
-
-      const interval = setInterval(() => {
-        progress += 10 + Math.random() * 15;
-        if (progress >= 100 && phaseIdx < phases.length - 1) {
-          phaseIdx++;
-          progress = 0;
-          if (phases[phaseIdx] === 'evolving') round++;
-        }
-        const phase = phases[phaseIdx];
-        const msgs = logMessages[phase];
-        const msg = msgs[Math.floor(Math.random() * msgs.length)];
-
-        const dp = miningDataPointsRef.current;
-        const metrics: RealtimeMetrics | undefined =
-          ['backtesting', 'analyzing', 'completed'].includes(phase)
-            ? {
-                ic: 0.05 + Math.random() * 0.03,
-                icir: 0.5 + Math.random() * 0.3,
-                rankIc: 0.04 + Math.random() * 0.03,
-                rankIcir: 0.45 + Math.random() * 0.3,
-                annualReturn: 0.12 + Math.random() * 0.08,
-                sharpeRatio: 1.2 + Math.random() * 0.5,
-                maxDrawdown: -(0.08 + Math.random() * 0.05),
-                totalFactors: Math.min(50 + dp * 2, 80),
-                highQualityFactors: Math.min(15 + Math.floor(dp * 0.7), 25),
-                mediumQualityFactors: Math.min(20 + Math.floor(dp * 0.8), 30),
-                lowQualityFactors: Math.min(10 + Math.floor(dp * 0.5), 20),
-              }
-            : undefined;
-
-        if (['backtesting', 'analyzing', 'completed'].includes(phase)) {
-          pushMiningDataPoint();
-        }
-
-        setMiningTask((prev) => {
-          if (!prev) return prev;
-          return {
-            ...prev,
-            status: phase === 'completed' ? 'completed' : 'running',
-            progress: {
-              phase: phase as any,
-              currentRound: round,
-              totalRounds: config.maxRounds || 7,
-              progress,
-              message: msg,
-              timestamp: new Date().toISOString(),
-            },
-            metrics,
-            logs: [
-              ...(prev.logs || []),
-              {
-                id: generateId(),
-                timestamp: new Date().toISOString(),
-                level: (Math.random() > 0.95 ? 'warning' : 'info') as 'warning' | 'info',
-                message: msg,
-              },
-            ].slice(-30),
-            updatedAt: new Date().toISOString(),
-          };
-        });
-
-        if (phase === 'completed') clearInterval(interval);
-      }, 300);
-    },
-    [pushMiningDataPoint],
-  );
-
-  // Public start mining
-  const startMining = useCallback(
-    (config: TaskConfig) => {
-      if (backendAvailable) {
-        startRealMining(config);
-      } else {
-        startMockMining(config);
-      }
-    },
-    [backendAvailable, startRealMining, startMockMining],
-  );
-
-  // Stop mining
-  const stopMining = useCallback(async () => {
-    if (!miningTask) return;
-    miningWsRef.current?.close();
-    miningWsRef.current = null;
-    if (miningPollingRef.current) {
-      clearInterval(miningPollingRef.current);
-      miningPollingRef.current = null;
-    }
-    if (backendAvailable) {
-      try {
-        await apiCancelMining(miningTask.taskId);
-      } catch {
-        // ignore
-      }
-    }
-    setMiningTask((prev) => (prev ? { ...prev, status: 'failed' } : prev));
-  }, [miningTask, backendAvailable]);
-
-  // Reset mining task
-  const resetMiningTask = useCallback(() => {
-    // Ensure stopped first
-    miningWsRef.current?.close();
-    miningWsRef.current = null;
-    if (miningPollingRef.current) {
-      clearInterval(miningPollingRef.current);
-      miningPollingRef.current = null;
-    }
-    setMiningTask(null);
-    setMiningEquityCurve([]);
-    setMiningDrawdownCurve([]);
-    setMiningIcTimeSeries([]);
-  }, []);
-
-  // ==================================================================
-  // BACKTEST
-  // ==================================================================
-  const [backtestTask, setBacktestTask] = useState<BacktestTask | null>(null);
-  const [backtestLogs, setBacktestLogs] = useState<LogEntry[]>([]);
-
-  const backtestWsRef = useRef<WebSocket | null>(null);
-  const backtestPollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  // WS handler for backtest
-  // IMPORTANT: setBacktestLogs must NOT be inside setBacktestTask's updater function,
-  // because React StrictMode double-invokes updater functions in development mode,
-  // which would cause every log entry to be added twice.
-  const handleBacktestWsMessage = useCallback((msg: WsMessage) => {
-    switch (msg.type) {
-      case 'progress':
-        setBacktestTask((prev) => {
-          if (!prev) return prev;
-          return { ...prev, progress: msg.data, updatedAt: new Date().toISOString() };
-        });
-        break;
-      case 'log':
-        setBacktestLogs((l) => [...l.slice(-499), msg.data as LogEntry]);
-        break;
-      case 'metrics':
-        setBacktestTask((prev) => {
-          if (!prev) return prev;
-          return { ...prev, metrics: msg.data, updatedAt: new Date().toISOString() };
-        });
-        break;
-      case 'result':
-        setBacktestTask((prev) => {
-          if (!prev) return prev;
-          return {
-            ...prev,
-            status: msg.data.status === 'completed' ? 'completed' : 'failed',
-            metrics: msg.data.metrics || prev.metrics,
-            updatedAt: new Date().toISOString(),
-          };
-        });
-        break;
-      case 'error':
-        setBacktestTask((prev) => {
-          if (!prev) return prev;
-          return { ...prev, status: 'failed', updatedAt: new Date().toISOString() };
-        });
-        break;
-    }
-  }, []);
-
-  // Start backtest
-  const startBacktestTask = useCallback(
-    async (params: BacktestStartParams) => {
-      setBacktestLogs([]);
-      const resp = await apiStartBacktest(params);
-      if (!resp.success || !resp.data) throw new Error(resp.error || 'Failed');
-
-      const taskData = resp.data.task as unknown as BacktestTask;
-      setBacktestTask(taskData);
-
-      // WebSocket
-      const ws = connectMiningWs(
-        resp.data.taskId,
-        handleBacktestWsMessage,
-        () => {
-          getBacktestStatus(resp.data!.taskId).then((r) => {
-            if (r.data?.task) setBacktestTask(r.data.task as unknown as BacktestTask);
-          });
-        },
-      );
-      backtestWsRef.current = ws;
-
-      // Polling fallback
-      backtestPollingRef.current = setInterval(async () => {
-        try {
-          const r = await getBacktestStatus(resp.data!.taskId);
-          if (r.data?.task) {
-            const t = r.data.task as unknown as BacktestTask;
-
-            // Always sync progress from polling (in case WS missed updates)
-            setBacktestTask((prev) => {
-              if (!prev) return t;
-              return {
-                ...prev,
-                status: t.status,
-                progress: t.progress || prev.progress,
-                metrics: (t.metrics && Object.keys(t.metrics).length > 0) ? t.metrics : prev.metrics,
-                updatedAt: t.updatedAt,
-              };
-            });
-
-            if (t.status === 'completed' || t.status === 'failed' || t.status === 'cancelled') {
-              // Final update: sync task + logs from backend (in case WS missed some)
-              setBacktestTask(t);
-              if (t.logs && t.logs.length > 0) {
-                setBacktestLogs(t.logs.slice(-500));
-              }
-              clearInterval(backtestPollingRef.current!);
-              backtestPollingRef.current = null;
-            }
-          }
-        } catch {
-          // ignore
-        }
-      }, 5000);
-    },
-    [handleBacktestWsMessage],
-  );
-
-  // Stop backtest
-  const stopBacktestTask = useCallback(async () => {
-    if (!backtestTask) return;
-    backtestWsRef.current?.close();
-    backtestWsRef.current = null;
-    if (backtestPollingRef.current) {
-      clearInterval(backtestPollingRef.current);
-      backtestPollingRef.current = null;
-    }
-    try {
-      await apiCancelBacktest(backtestTask.taskId);
-    } catch {
-      // ignore
-    }
-    setBacktestTask((prev) => (prev ? { ...prev, status: 'cancelled' } : prev));
-  }, [backtestTask]);
-
-  // ==================================================================
-  // FORECAST AGENT
-  // ==================================================================
-  const [forecastAgentTask, setForecastAgentTask] = useState<BacktestTask | null>(null);
-  const [forecastAgentLogs, setForecastAgentLogs] = useState<LogEntry[]>([]);
-  const [forecastAgentMessages, setForecastAgentMessages] = useState<ForecastAgentMessage[]>([]);
-  const forecastAgentWsRef = useRef<WebSocket | null>(null);
-  const forecastAgentPollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const handleForecastAgentWsMessage = useCallback((msg: WsMessage) => {
     switch (msg.type) {
@@ -624,8 +87,8 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setForecastAgentLogs((l) => [...l.slice(-499), msg.data as LogEntry]);
         break;
       case 'metrics':
-        if (msg.data && typeof msg.data === 'object' && (msg.data as any).agent_message) {
-          const nextMsg = (msg.data as any).agent_message as ForecastAgentMessage;
+        if (msg.data?.agent_message) {
+          const nextMsg = msg.data.agent_message as ForecastAgentMessage;
           setForecastAgentMessages((prev) => {
             const last = prev[prev.length - 1];
             if (
@@ -641,11 +104,11 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
         }
         setForecastAgentTask((prev) => {
           if (!prev) return prev;
-          const nextMetrics = {
-            ...(prev.metrics || {}),
-            ...(msg.data || {}),
+          return {
+            ...prev,
+            metrics: { ...(prev.metrics || {}), ...(msg.data || {}) },
+            updatedAt: new Date().toISOString(),
           };
-          return { ...prev, metrics: nextMetrics, updatedAt: new Date().toISOString() };
         });
         break;
       case 'result':
@@ -653,89 +116,97 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
           if (!prev) return prev;
           return {
             ...prev,
-            status: msg.data.status === 'completed' ? 'completed' : 'failed',
+            status: msg.data.status === 'completed' ? 'completed' : msg.data.status || 'failed',
             metrics: msg.data.metrics || prev.metrics,
             updatedAt: new Date().toISOString(),
           };
         });
         break;
       case 'error':
-        setForecastAgentTask((prev) => {
-          if (!prev) return prev;
-          return { ...prev, status: 'failed', updatedAt: new Date().toISOString() };
-        });
+        setForecastAgentTask((prev) => (prev ? { ...prev, status: 'failed', updatedAt: new Date().toISOString() } : prev));
         setForecastAgentLogs((l) => [
           ...l.slice(-498),
           {
             id: generateId(),
             timestamp: new Date().toISOString(),
             level: 'error',
-            message: (msg.data && (msg.data as any).error) || 'Agent task failed',
+            message: msg.data?.error || 'Agent task failed',
           },
         ]);
         break;
     }
   }, []);
 
-  const startForecastAgentTask = useCallback(
-    async (params: ForecastAgentStartParams) => {
-      setForecastAgentLogs([]);
-      setForecastAgentMessages([]);
-      const resp = await apiStartForecastAgent(params);
-      if (!resp.success || !resp.data) throw new Error(resp.error || 'Failed');
-
-      const taskData = resp.data.task as unknown as BacktestTask;
-      setForecastAgentTask(taskData);
-      const initialMessages =
-        ((taskData.metrics as any)?.agent_messages as ForecastAgentMessage[] | undefined) || [];
-      if (initialMessages.length > 0) {
-        setForecastAgentMessages(initialMessages);
+  const attachPolling = useCallback(
+    (taskId: string) => {
+      if (forecastAgentPollingRef.current) {
+        clearInterval(forecastAgentPollingRef.current);
       }
-
-      const ws = connectMiningWs(
-        resp.data.taskId,
-        handleForecastAgentWsMessage,
-        () => {
-          getForecastAgentStatus(resp.data!.taskId).then((r) => {
-            if (r.data?.task) setForecastAgentTask(r.data.task as unknown as BacktestTask);
-          });
-        },
-      );
-      forecastAgentWsRef.current = ws;
-
       forecastAgentPollingRef.current = setInterval(async () => {
         try {
-          const r = await getForecastAgentStatus(resp.data!.taskId);
-          if (r.data?.task) {
-            const t = r.data.task as unknown as BacktestTask;
-            setForecastAgentTask((prev) => {
-              if (!prev) return t;
-              return {
-                ...prev,
-                status: t.status,
-                progress: t.progress || prev.progress,
-                metrics: t.metrics && Object.keys(t.metrics).length > 0 ? t.metrics : prev.metrics,
-                updatedAt: t.updatedAt,
-              };
-            });
-            if (t.status === 'completed' || t.status === 'failed' || t.status === 'cancelled') {
-              setForecastAgentTask(t);
-              if (t.logs?.length) setForecastAgentLogs(t.logs.slice(-500));
-              const finalMessages =
-                ((t.metrics as any)?.agent_messages as ForecastAgentMessage[] | undefined) || [];
-              if (finalMessages.length > 0) {
-                setForecastAgentMessages(finalMessages);
-              }
-              clearInterval(forecastAgentPollingRef.current!);
-              forecastAgentPollingRef.current = null;
-            }
+          const r = await getForecastAgentStatus(taskId);
+          if (!r.data?.task) return;
+          const t = r.data.task as unknown as ForecastAgentTaskState;
+          setForecastAgentTask((prev) => {
+            if (!prev) return t;
+            return {
+              ...prev,
+              status: t.status,
+              progress: t.progress || prev.progress,
+              metrics: t.metrics && Object.keys(t.metrics).length > 0 ? t.metrics : prev.metrics,
+              lastCheckpoint: t.lastCheckpoint ?? prev.lastCheckpoint,
+              checkpointPathDisplay: t.checkpointPathDisplay ?? prev.checkpointPathDisplay,
+              auditPathDisplay: t.auditPathDisplay ?? prev.auditPathDisplay,
+              updatedAt: t.updatedAt,
+            };
+          });
+          if (t.status === 'completed' || t.status === 'failed' || t.status === 'cancelled') {
+            setForecastAgentTask(t);
+            if (t.logs?.length) setForecastAgentLogs(t.logs.slice(-500));
+            const finalMessages = (t.metrics?.agent_messages as ForecastAgentMessage[] | undefined) || [];
+            if (finalMessages.length > 0) setForecastAgentMessages(finalMessages);
+            clearInterval(forecastAgentPollingRef.current!);
+            forecastAgentPollingRef.current = null;
           }
         } catch {
-          // ignore
+          // ignore polling errors
         }
       }, 5000);
     },
-    [handleForecastAgentWsMessage],
+    []
+  );
+
+  const connectWs = useCallback(
+    (taskId: string) => {
+      forecastAgentWsRef.current?.close();
+      forecastAgentWsRef.current = connectTaskWs(taskId, handleForecastAgentWsMessage, () => {
+        getForecastAgentStatus(taskId).then((r) => {
+          if (r.data?.task) setForecastAgentTask(r.data.task as unknown as ForecastAgentTaskState);
+        });
+      });
+    },
+    [handleForecastAgentWsMessage]
+  );
+
+  const startForecastAgentTask = useCallback(
+    async (params: ForecastAgentStartParams) => {
+      if (!backendAvailable) {
+        throw new Error('后端未连接，请先启动 FastAPI 服务');
+      }
+      setForecastAgentLogs([]);
+      setForecastAgentMessages([]);
+      const resp = await apiStartForecastAgent(params);
+      if (!resp.success || !resp.data) throw new Error(resp.error || '启动失败');
+
+      const taskData = resp.data.task as unknown as ForecastAgentTaskState;
+      setForecastAgentTask(taskData);
+      const initialMessages = (taskData.metrics?.agent_messages as ForecastAgentMessage[] | undefined) || [];
+      if (initialMessages.length > 0) setForecastAgentMessages(initialMessages);
+
+      connectWs(resp.data.taskId);
+      attachPolling(resp.data.taskId);
+    },
+    [backendAvailable, attachPolling, connectWs]
   );
 
   const stopForecastAgentTask = useCallback(async () => {
@@ -758,111 +229,23 @@ export const TaskProvider: React.FC<{ children: React.ReactNode }> = ({ children
     async (params: ForecastAgentContinueParams) => {
       if (!forecastAgentTask) return;
       const resp = await apiContinueForecastAgent(forecastAgentTask.taskId, params);
-      if (!resp.success) throw new Error(resp.error || 'Failed to continue');
+      if (!resp.success) throw new Error(resp.error || '继续失败');
     },
-    [forecastAgentTask],
+    [forecastAgentTask]
   );
 
-  const resumeForecastAgentTask = useCallback(
-    async (params: ForecastAgentResumeParams = {}) => {
-      if (!forecastAgentTask) return;
-
-      forecastAgentWsRef.current?.close();
-      forecastAgentWsRef.current = null;
-      if (forecastAgentPollingRef.current) {
-        clearInterval(forecastAgentPollingRef.current);
-        forecastAgentPollingRef.current = null;
-      }
-
-      const resp = await apiResumeForecastAgent(forecastAgentTask.taskId, params);
-      if (!resp.success || !resp.data?.task) {
-        throw new Error(resp.error || 'Failed to resume');
-      }
-
-      const taskData = resp.data.task as unknown as BacktestTask;
-      setForecastAgentTask(taskData);
-      setForecastAgentLogs([]);
-      setForecastAgentMessages([]);
-
-      const ws = connectMiningWs(
-        forecastAgentTask.taskId,
-        handleForecastAgentWsMessage,
-        () => {
-          getForecastAgentStatus(forecastAgentTask.taskId).then((r) => {
-            if (r.data?.task) setForecastAgentTask(r.data.task as unknown as BacktestTask);
-          });
-        },
-      );
-      forecastAgentWsRef.current = ws;
-
-      forecastAgentPollingRef.current = setInterval(async () => {
-        try {
-          const r = await getForecastAgentStatus(forecastAgentTask.taskId);
-          if (r.data?.task) {
-            const t = r.data.task as unknown as BacktestTask;
-            setForecastAgentTask((prev) => {
-              if (!prev) return t;
-              return {
-                ...prev,
-                status: t.status,
-                progress: t.progress || prev.progress,
-                metrics: t.metrics && Object.keys(t.metrics).length > 0 ? t.metrics : prev.metrics,
-                updatedAt: t.updatedAt,
-              };
-            });
-            if (t.status === 'completed' || t.status === 'failed' || t.status === 'cancelled') {
-              setForecastAgentTask(t);
-              if (t.logs?.length) setForecastAgentLogs(t.logs.slice(-500));
-              const finalMessages =
-                ((t.metrics as any)?.agent_messages as ForecastAgentMessage[] | undefined) || [];
-              if (finalMessages.length > 0) {
-                setForecastAgentMessages(finalMessages);
-              }
-              clearInterval(forecastAgentPollingRef.current!);
-              forecastAgentPollingRef.current = null;
-            }
-          }
-        } catch {
-          // ignore
-        }
-      }, 5000);
-    },
-    [forecastAgentTask, handleForecastAgentWsMessage],
-  );
-
-  // ==================================================================
-  // Context value
-  // ==================================================================
   const value: TaskContextValue = {
     backendAvailable,
-    // Mining
-    miningTask,
-    miningEquityCurve,
-    miningDrawdownCurve,
-    miningIcTimeSeries,
-    startMining,
-    stopMining,
-    resetMiningTask,
-
-    // ---- Backtest ----
-    backtestTask,
-    backtestLogs,
-    startBacktestTask,
-    stopBacktestTask,
-
     forecastAgentTask,
     forecastAgentLogs,
     forecastAgentMessages,
     startForecastAgentTask,
     continueForecastAgentTask,
-    resumeForecastAgentTask,
     stopForecastAgentTask,
   };
 
   return <TaskContext.Provider value={value}>{children}</TaskContext.Provider>;
 };
-
-// ========================== Hook ==========================
 
 export function useTaskContext(): TaskContextValue {
   const ctx = useContext(TaskContext);
