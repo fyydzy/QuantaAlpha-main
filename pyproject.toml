@@ -16,20 +16,19 @@ classifiers = [
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
 ]
-description = "QuantaAlpha - LLM-Driven Alpha Factor Mining Agent"
+description = "QuantaAlpha - 天然气市场需求预测（智能体 + 天气）"
 dynamic = [
   "dependencies",
   "optional-dependencies",
   "version",
 ]
 keywords = [
-  "Quantitative Finance",
-  "Factor Mining",
+  "Natural Gas Forecast",
+  "Weather Forecast",
   "Large Language Models",
   "Autonomous Agents",
 ]
 name = "quantaalpha"
-readme = "README.md"
 requires-python = ">=3.10"
 
 [project.scripts]
@@ -46,7 +45,6 @@ packages = {find = {where = ["."]}}
 dependencies = {file = ["requirements.txt"]}
 
 [tool.setuptools.dynamic.optional-dependencies]
-docs = {file = ["requirements/docs.txt"]}
 forecast = {file = ["requirements/forecast.txt"]}
 forecast-all = {file = ["requirements/forecast-all.txt"]}
 weather = {file = ["requirements/weather.txt"]}

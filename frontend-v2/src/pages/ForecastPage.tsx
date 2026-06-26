@@ -178,16 +178,41 @@ function ForecastPredActualChart({ data }: { data: ForecastCurvePoint[] }) {
   );
 }
 
-function StagePayload({ stage, payload }: { stage: string; payload: any }) {
+function StagePayload({
+  stage,
+  payload,
+  toolEvent,
+}: {
+  stage: string;
+  payload: any;
+  toolEvent?: {
+    tool?: string;
+    status?: string;
+    durationMs?: number;
+    error?: string;
+  } | null;
+}) {
   if (!payload || typeof payload !== 'object') return null;
 
   const panel = (children: React.ReactNode) => (
     <div className="mt-3 rounded-lg border border-border/50 bg-secondary/20 p-3 text-sm">{children}</div>
   );
+  const panelWithTool = (children: React.ReactNode) =>
+    panel(
+      <div className="space-y-2">
+        {children}
+        {toolEvent && (
+          <div className="text-[11px] text-muted-foreground border-t border-border/40 pt-2">
+            工具 {toolEvent.tool || '-'} · {toolEvent.status || '-'} · 耗时 {toolEvent.durationMs ?? 0}ms
+            {toolEvent.error ? ` · ${toolEvent.error}` : ''}
+          </div>
+        )}
+      </div>,
+    );
 
-  if (stage === 'parse_intent' || stage === 'intent_applied' || stage === 'confirm_intent') {
+  if (stage === 'parse_intent' || stage === 'intent_applied' || stage === 'confirm_intent' || stage === 'resume') {
     const data = payload.intent || payload;
-    return panel(
+    return panelWithTool(
       <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-xs">
         <div><span className="text-muted-foreground">省份</span> {data.province || '-'}</div>
         <div><span className="text-muted-foreground">目标月</span> {data.target_month || '-'}</div>
@@ -199,7 +224,7 @@ function StagePayload({ stage, payload }: { stage: string; payload: any }) {
   }
 
   if (stage === 'data_loading') {
-    return panel(
+    return panelWithTool(
       <div className="text-xs text-muted-foreground font-mono break-all">
         {payload.dataPath || '-'}
       </div>,
@@ -208,7 +233,7 @@ function StagePayload({ stage, payload }: { stage: string; payload: any }) {
 
   if (stage === 'diagnose') {
     const top = Array.isArray(payload.topFeatures) ? payload.topFeatures.slice(0, 8) : [];
-    return panel(
+    return panelWithTool(
       <div className="space-y-2">
         {top.length > 0 && (
           <div className="flex flex-wrap gap-1.5">
@@ -225,7 +250,7 @@ function StagePayload({ stage, payload }: { stage: string; payload: any }) {
 
   if (stage === 'recommend' || stage === 'features_applied' || stage === 'confirm_features') {
     const fs = Array.isArray(payload.featureSuperset) ? payload.featureSuperset : [];
-    return panel(
+    return panelWithTool(
       <div className="space-y-2">
         <div className="flex flex-wrap gap-1.5">
           {fs.map((f: string) => (
@@ -248,7 +273,7 @@ function StagePayload({ stage, payload }: { stage: string; payload: any }) {
       : Array.isArray(payload.forecast_curve)
         ? payload.forecast_curve
         : [];
-    return panel(
+    return panelWithTool(
       <div className="space-y-3">
         {outputDir && (
           <p className="text-xs text-muted-foreground">
@@ -326,10 +351,10 @@ function StagePayload({ stage, payload }: { stage: string; payload: any }) {
   }
 
   if (stage === 'qa' && payload.answer) {
-    return panel(renderMarkdownLike(String(payload.answer)));
+    return panelWithTool(renderMarkdownLike(String(payload.answer)));
   }
 
-  return panel(
+  return panelWithTool(
     <pre className="text-xs overflow-x-auto">{JSON.stringify(payload, null, 2)}</pre>,
   );
 }
@@ -422,13 +447,18 @@ export const ForecastPage: React.FC = () => {
   }, [completed, forecastAgentTask?.taskId]);
 
   useEffect(() => {
-    for (let i = forecastAgentMessages.length - 1; i >= 0; i -= 1) {
-      const msg = forecastAgentMessages[i];
-      if (msg.stage !== 'parse_intent' && msg.stage !== 'intent_applied') continue;
-      const p = String((msg.payload as { province?: string } | undefined)?.province || '').trim();
-      if (p) {
-        setProvince(p);
-        break;
+    const preferredStages = ['intent_applied', 'parse_intent'];
+    for (const preferred of preferredStages) {
+      for (let i = forecastAgentMessages.length - 1; i >= 0; i -= 1) {
+        const msg = forecastAgentMessages[i];
+        if (msg.stage !== preferred) continue;
+        const data = ((msg.payload as { intent?: { province?: string }; province?: string } | undefined)?.intent
+          || msg.payload) as { province?: string } | undefined;
+        const p = String(data?.province || '').trim();
+        if (p) {
+          setProvince(p);
+          return;
+        }
       }
     }
   }, [forecastAgentMessages]);
@@ -440,6 +470,17 @@ export const ForecastPage: React.FC = () => {
   const awaitingCheckpoint = awaiting?.checkpoint as string | undefined;
   const canReply = running && !!awaitingCheckpoint;
   const isBusy = submitting || (running && !canReply);
+  const toolEvents = Array.isArray((metrics as any).tool_events) ? ((metrics as any).tool_events as any[]) : [];
+  const latestToolEvent = toolEvents.length > 0 ? toolEvents[toolEvents.length - 1] : null;
+  const toolEventByStage = useMemo(() => {
+    const map: Record<string, any> = {};
+    for (const e of toolEvents) {
+      const stage = String(e?.stage || '').trim();
+      if (!stage) continue;
+      map[stage] = e;
+    }
+    return map;
+  }, [toolEvents]);
 
   const quickReplies = awaitingCheckpoint ? QUICK_REPLIES[awaitingCheckpoint] || [] : [];
 
@@ -571,8 +612,8 @@ export const ForecastPage: React.FC = () => {
   const showWelcome = !forecastAgentTask && forecastAgentMessages.length === 0;
 
   const renderPayload = useCallback((stage: string, payload: any) => {
-    return <StagePayload stage={stage} payload={payload} />;
-  }, []);
+    return <StagePayload stage={stage} payload={payload} toolEvent={toolEventByStage[stage] || null} />;
+  }, [toolEventByStage]);
 
   const placeholder = useMemo(() => {
     if (canReply) {
@@ -633,6 +674,19 @@ export const ForecastPage: React.FC = () => {
               <span>{progressValue}%</span>
             </div>
             <Progress value={progressValue} />
+          </div>
+        )}
+        {forecastAgentTask && (
+          <div className="mt-2 text-[11px] text-muted-foreground flex flex-wrap gap-x-3 gap-y-1">
+            {(forecastAgentTask as any).auditPathDisplay && (
+              <span>audit：{String((forecastAgentTask as any).auditPathDisplay)}</span>
+            )}
+            {latestToolEvent && (
+              <span>
+                最近工具：{String(latestToolEvent.tool || '-')} / {String(latestToolEvent.status || '-')} /{' '}
+                {Number(latestToolEvent.durationMs || 0)}ms
+              </span>
+            )}
           </div>
         )}
       </div>

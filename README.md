@@ -1,454 +1,268 @@
-<div align="center">
-  <img src="docs/images/overview.jpg" alt="QuantaAlpha Framework Overview" width="90%" style="border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); margin: 10px 0;"/>
-</div>
-
-<div align="center">
-
-  <h1 align="center" style="color: #2196F3; font-size: 32px; font-weight: 700; margin: 20px 0; line-height: 1.4;">
-    🌟 QuantaAlpha: <span style="color: #555; font-weight: 400; font-size: 20px;"><em>LLM-Driven Self-Evolving Framework for Factor Mining</em></span>
-  </h1>
-
-  <p align="center" style="font-size: 14px; color: #888; max-width: 700px; margin: 10px auto;">
-    🧬 <em>Achieving superior quantitative alpha through trajectory-based self-evolution with diversified planning initialization, trajectory-level evolution, and structured hypothesis-code constraint</em>
-  </p>
-
-  <p style="margin: 20px 0;">
-    <a href="https://arxiv.org/abs/2602.07085"><img src="https://img.shields.io/badge/arXiv-b31b1b.svg?style=flat-square&logo=arxiv&logoColor=white" /></a>
-    <a href="#"><img src="https://img.shields.io/badge/License-MIT-00A98F.svg?style=flat-square&logo=opensourceinitiative&logoColor=white" /></a>
-    <a href="#"><img src="https://img.shields.io/badge/Python-3.10+-3776AB.svg?style=flat-square&logo=python&logoColor=white" /></a>
-    <a href="https://github.com/QuantaAlpha/QuantaAlpha"><img src="https://img.shields.io/github/stars/QuantaAlpha/QuantaAlpha?style=flat-square&logo=github&logoColor=white&color=yellow" /></a>
-  </p>
-
-  <p style="font-size: 16px; color: #666; margin: 15px 0; font-weight: 500;">
-    🌐 <a href="README.md" style="text-decoration: none; color: #0066cc;">English</a> | <a href="README_CN.md" style="text-decoration: none; color: #0066cc;">中文</a>
-  </p>
-
-</div>
-
-<div align="center" style="margin: 30px 0;">
-  <a href="#-quick-start" style="text-decoration: none; margin: 0 4px;">
-    <img src="https://img.shields.io/badge/🚀_Quick_Start-Get_Started-4CAF50?style=flat-square&logo=rocket&logoColor=white&labelColor=2E7D32" alt="Quick Start" />
-  </a>
-  <a href="#️-web-dashboard" style="text-decoration: none; margin: 0 4px;">
-    <img src="https://img.shields.io/badge/🖥️_Web_UI-Try_It_Now-FF9800?style=flat-square&logo=play&logoColor=white&labelColor=F57C00" alt="Web Dashboard" />
-  </a>
-  <a href="docs/user_guide.md" style="text-decoration: none; margin: 0 4px;">
-    <img src="https://img.shields.io/badge/📖_User_Guide-Complete_Guide-2196F3?style=flat-square&logo=gitbook&logoColor=white&labelColor=1565C0" alt="User Guide" />
-  </a>
-  <a href="experiment/README_EXPERIMENT.md" style="text-decoration: none; margin: 0 4px;">
-    <img src="https://img.shields.io/badge/🔬_Experiments-Replication-9C27B0?style=flat-square&logo=labview&logoColor=white&labelColor=7B1FA2" alt="Experiments" />
-  </a>
-</div>
+# 天然气市场需求预测
 
 ---
 
-## 🎯 Overview
+## 一、介绍
 
-**QuantaAlpha** transforms how you discover quantitative alpha factors by combining LLM intelligence with evolutionary strategies. Just describe your research direction, and watch as factors are automatically mined, evolved, and validated through self-evolving trajectories.
+本系统包含两个 Web 功能（同一套前后端，导航栏切换）：
 
-<p align="center">💬 Research Direction → 🧩 Diversified Planning → 🔄 Trajectory → ✅ Validated Alpha Factors</p>
+### 1. 今冬明春预测（燃气销量）
 
-**Demo**: Below is a short demo of the full flow from research direction to factor mining and backtesting UI. 
+- **对话式智能体**：用自然语言描述预测需求（省份、月份等），系统自动解析意图
+- **人机确认**：参数确认、特征确认两个节点，可回复「继续」或说明修改
+- **自动流程**：xgboost 特征诊断 → LLM 特征推荐 → 多模型比选 → 结果展示
+- **结果可视化**：模型榜单、月度汇总表、预测值 vs 真实值曲线
+- **完成后追问**：基于预测结果表向 LLM 提问
 
-<div align="center">
-  <video src="https://github.com/user-attachments/assets/726511ce-a384-4727-a7be-948a2cf05e4b"
-         controls
-         style="max-width: 90%; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1);">
-    Your browser does not support the video tag.
-    <a href="https://github.com/user-attachments/assets/726511ce-a384-4727-a7be-948a2cf05e4b">Watch the demo video</a>.
-  </video>
-  <p style="font-size: 12px; color: #666; margin-top: 8px;">
-    ▶ Click to play the QuantaAlpha end-to-end workflow demo.
-  </p>
-</div>
+导航入口：**「今冬明春预测」**
 
----
+### 2. 天气预测（ECMWF 季节气温）
 
-## 📊 Performance
+- 查看 **ECMWF S5 季节预报** 导出的河北代表点气温数据
+- **左栏**：6 小时步长预览（`*_preview.csv`），按北京日期 + 整点查 `temp_mean_c` / 分位数
+- **右栏**：日度气温（`hebei_ecmwf_s5_daily_temperature_*.csv`），按日期查看集合平均与 P10/P50/P90
+- 数据文件放在 `data/weather/`，由脚本从 CDS 下载 NetCDF 后导出（也可直接打包现成 CSV）
 
-### 1. Factor Performance
+导航入口：**「天气预测」**
 
-<div align="center">
-  <img src="docs/images/figure3.png" width="90%" alt="Zero-Shot Transfer" style="border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1);"/>
-  <p style="font-size: 12px; color: #666;">CSI 300 factors transferred to CSI 500/S&P 500</p>
-</div>
-
-### 2. Key Results
-
-<div align="center">
-
-| Dimension | Metric | Performance |
-| :---: | :---: | :---: |
-| **Predictive Power** | Information Coefficient (IC) | **0.1501** |
-| | Rank IC | **0.1465** |
-| **Strategy Return** | Annualized Excess Return (ARR) | **27.75%** |
-| | Max Drawdown (MDD) | **7.98%** |
-| | Calmar Ratio (CR) | **3.4774** |
-
-</div>
-
-<div align="center">
-  <img src="docs/images/主实验.png" width="90%" alt="Main Experiment Results" style="border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1);"/>
-</div>
+详细下载与脚本说明见 `scripts/weather/` 目录（`download_s5_hebei.py`、`preview_nc.py`、`extract_daily_temperature.py`）。
 
 ---
 
-## 🚀 Quick Start
+## 二、环境要求
 
-<p align="center" style="font-size: 13px; color: #666; margin-top: 10px;">
-  🔬 Experiments: paper reproduction settings & metric definitions — <a href="experiment/README_EXPERIMENT.md"><b>English</b></a> · <a href="experiment/README_EXPERIMENT_CN.md"><b>中文</b></a>
-</p>
 
-### 1. Clone & Install
+| 项目                               | 版本建议               |
+| -------------------------------- | ------------------ |
+| Python                           | 3.10 或 3.11        |
+| [uv](https://docs.astral.sh/uv/) | 用于管理项目虚拟环境（**推荐**） |
+| Node.js                          | 18 及以上             |
 
-```bash
-git clone https://github.com/QuantaAlpha/QuantaAlpha.git
-cd QuantaAlpha
-conda create -n quantaalpha python=3.10
-conda activate quantaalpha
-# Install the package in development mode
-SETUPTOOLS_SCM_PRETEND_VERSION=0.1.0 pip install -e .
 
-# Install additional dependencies
-pip install -r requirements.txt
+另需准备：
+
+1. **LLM API**（今冬明春预测必填）：在 `.env` 中配置 `OPENAI_API_KEY`、`OPENAI_BASE_URL`、`CHAT_MODEL`（模板见根目录 `.env.example`）
+2. **省级燃气历史数据**：Excel 放在 `data/processed_data/{省份}.xlsx`（说明见同目录 `README.md`）
+3. **气温 CSV**（天气预测页必填，若只跑燃气可不带）：放在 `data/weather/`，例如：
+  - `ecmwf_s5_hebei_t2m_20260501_preview.csv`（6 小时预览）
+  - `hebei_ecmwf_s5_daily_temperature_20260501.csv`（日度）
+4. **CDS 凭据**（仅当接收方需**自行从 Copernicus 下载**新气温数据时）：在 `.env` 中配置 `CDSAPI_URL`、`CDSAPI_KEY`（见根目录 `.env.example` 注释）
+
+### 交付包中应自带的模板文件
+
+
+| 文件                              | 作用                                  |
+| ------------------------------- | ----------------------------------- |
+| `.env.example`                  | 环境变量模板；接收方复制为 `.env` 后填写密钥          |
+| `data/processed_data/README.md` | 省级燃气 Excel 数据说明                     |
+| `data/weather/` 下示例 CSV         | 天气预测页可直接使用（建议至少带一组 preview + daily） |
+| `configs/forecast.yaml`         | 命令行燃气预测默认参数（可选）                     |
+| `交付说明.md`                       | 本说明                                 |
+
+
+各省 `*.xlsx` 需手动放入 `data/processed_data/` 再打包；`data/weather/*.csv` 若已生成，建议一并打入。
+
+## 三、安装步骤
+
+在解压后的**项目根目录**打开 PowerShell：
+
+### 1. 安装 Python 依赖
+
+```powershell
+cd <解压路径>\QuantaAlpha-main
+$env:SETUPTOOLS_SCM_PRETEND_VERSION_FOR_QUANTAALPHA = "0.1.0"
+
+uv sync
+uv sync --extra forecast
+
+# 可选：需要从 CDS 自行下载/处理气温 NetCDF 时
+uv sync --extra weather
+
+uv pip install fastapi uvicorn websockets python-multipart python-dotenv pyyaml
 ```
 
-### 2. Configure Environment
+### 2. 配置环境变量
 
-```bash
-cp configs/.env.example .env
+```powershell
+copy .env.example .env
 ```
 
-Edit `.env` with your settings:
+```env
+OPENAI_API_KEY=你的真实密钥
+OPENAI_BASE_URL=https://你的接口地址/v1
+CHAT_MODEL=你的模型名
 
-```bash
-# === Required: Data Paths ===
-QLIB_DATA_DIR=/path/to/your/qlib/cn_data      # Qlib data directory
-DATA_RESULTS_DIR=/path/to/your/results         # Output directory
+FORECAST_DATA_DIR=data/processed_data
+FORECAST_DEFAULT_PROVINCE=河北
 
-# === Required: LLM API ===
-OPENAI_API_KEY=your-api-key
-OPENAI_BASE_URL=https://your-llm-provider/v1   # e.g. DashScope, OpenAI
-CHAT_MODEL=deepseek-v3                         # or gpt-4, qwen-max, etc.
-REASONING_MODEL=deepseek-v3
+# 仅天气数据下载脚本需要（Web 查看已有 CSV 可不填）
+# CDSAPI_URL=https://cds.climate.copernicus.eu/api
+# CDSAPI_KEY=你的_Copernicus_Personal_Access_Token
 ```
 
-### 3. Prepare Data
+> 全量模板另见 `configs/.env.example`。只跑 Web 查看气温时，通常只需 `data/weather/*.csv`，不必配置 CDS。
 
-QuantaAlpha requires two types of data: **Qlib market data** (for backtesting) and **pre-computed price-volume HDF5 files** (for factor mining). We provide all of them on HuggingFace for convenience.
+### 3. 准备燃气数据
 
-> **Dataset**: [https://huggingface.co/datasets/QuantaAlpha/qlib_csi300](https://huggingface.co/datasets/QuantaAlpha/qlib_csi300)
-
-| File | Description | Size | Usage |
-| :--- | :--- | :--- | :--- |
-| `cn_data.zip` | Qlib raw market data (A-share, 2016–2025) | 493 MB | Required for Qlib initialization & backtesting |
-| `daily_pv.h5` | Pre-computed full price-volume data | 398 MB | Required for factor mining |
-| `daily_pv_debug.h5` | Pre-computed debug subset (smaller) | 1.41 MB | Required for factor mining (debug/validation) |
-
-> **Why provide HDF5 files?** The system can auto-generate `daily_pv.h5` from Qlib data on first run, but this process is very slow. Downloading pre-built HDF5 files saves significant time.
-
-#### Step 1: Download
-
-```bash
-# Option A: Using huggingface-cli (recommended)
-pip install huggingface_hub
-huggingface-cli download QuantaAlpha/qlib_csi300 --repo-type dataset --local-dir ./hf_data
-
-# Option B: Using wget
-mkdir -p hf_data
-wget -P hf_data https://huggingface.co/datasets/QuantaAlpha/qlib_csi300/resolve/main/cn_data.zip
-wget -P hf_data https://huggingface.co/datasets/QuantaAlpha/qlib_csi300/resolve/main/daily_pv.h5
-wget -P hf_data https://huggingface.co/datasets/QuantaAlpha/qlib_csi300/resolve/main/daily_pv_debug.h5
+```text
+data/processed_data/河北.xlsx
+data/processed_data/江苏.xlsx
 ```
 
-#### Step 2: Extract & Place Files
+### 4. 准备气温数据（使用「天气预测」页时）
 
-```bash
-# 1. Extract Qlib data
-unzip hf_data/cn_data.zip -d ./data/qlib
+将 CSV 放入 `data/weather/`，页面会自动列出。示例：
 
-# 2. Place HDF5 files into the default data directories
-mkdir -p git_ignore_folder/factor_implementation_source_data
-mkdir -p git_ignore_folder/factor_implementation_source_data_debug
-
-cp hf_data/daily_pv.h5       git_ignore_folder/factor_implementation_source_data/daily_pv.h5
-cp hf_data/daily_pv_debug.h5  git_ignore_folder/factor_implementation_source_data_debug/daily_pv.h5
+```text
+data/weather/ecmwf_s5_hebei_t2m_20260501_preview.csv
+data/weather/hebei_ecmwf_s5_daily_temperature_20260501.csv
 ```
 
-> **Note**: `daily_pv_debug.h5` must be renamed to `daily_pv.h5` when placed in the debug directory.
+若包内没有这些文件，接收方需在 `.env` 配置 CDS 凭据，并运行 `scripts/weather/` 下脚本导出 CSV。
 
-#### Step 3: Configure Paths in `.env`
+### 5. 安装前端依赖
 
-```bash
-# Point to the extracted Qlib data directory (must contain calendars/, features/, instruments/)
-QLIB_DATA_DIR=./data/qlib/cn_data
-
-# Output directory for experiment results
-DATA_RESULTS_DIR=./data/results
-```
-
-The HDF5 data directories can also be customized via environment variables if you prefer a different location:
-
-```bash
-# Optional: override default HDF5 data paths
-FACTOR_CoSTEER_DATA_FOLDER=/your/custom/path/factor_source_data
-FACTOR_CoSTEER_DATA_FOLDER_DEBUG=/your/custom/path/factor_source_data_debug
-```
-
-### 4. Run Factor Mining
-
-```bash
-./run.sh "<your input>"
-
-# Example: Run with a research direction
-./run.sh "Price-Volume Factor Mining"
-
-# Example: Run with custom factor library suffix
-./run.sh "Microstructure Factors" "exp_micro"
-```
-
-The experiment will automatically mine, evolve, and validate alpha factors, and save all discovered factors to `all_factors_library*.json`.
-
-### 5. Gas Sales Forecast (optional, separate from factor mining)
-
-Decadal gas sales forecasting uses provincial Excel under `data/processed_data/` (column `date` = period start day). This pipeline is independent of `quantaalpha mine`.
-
-```bash
-# Recommended
-quantaalpha forecast --config configs/forecast.yaml
-
-# Or use the helper script
-./run_forecast.sh --model lasso --province 河北
-
-# Optional deps (includes LSTM/torch): uv sync --extra forecast
-```
-
-See [docs/forecast.md](docs/forecast.md)（含 CLI、依赖与 **Web UI** 安装/启动命令）.
-
-### 6. Independent Backtesting
-
-After mining, combine factors from the library for a full-period backtest:
-
-```bash
-# Backtest with custom factors only
-python -m quantaalpha.backtest.run_backtest \
-  -c configs/backtest.yaml \
-  --factor-source custom \
-  --factor-json all_factors_library.json
-
-# Combine with Alpha158(20) baseline factors
-python -m quantaalpha.backtest.run_backtest \
-  -c configs/backtest.yaml \
-  --factor-source combined \
-  --factor-json all_factors_library.json
-
-# Dry run (load factors only, skip backtest)
-python -m quantaalpha.backtest.run_backtest \
-  -c configs/backtest.yaml \
-  --factor-source custom \
-  --factor-json all_factors_library.json \
-  --dry-run -v
-```
-
-Results are saved to the directory specified in `configs/backtest.yaml` (`experiment.output_dir`).
-
-> 📘 Need help? Check our comprehensive **[User Guide](docs/user_guide.md)** for advanced configuration, experiment reproduction, and detailed usage examples.
-
----
-
-## 🖥️ Web UI
-
-QuantaAlpha provides a web-based dashboard where you can complete the entire workflow through a visual interface — no command line needed.
-
-```bash
-conda activate quantaalpha
+```powershell
 cd frontend-v2
-bash start.sh
-# Visit http://localhost:3000
+npm install
+cd ..
 ```
-
-- **⚙️ Settings**: Configure LLM API, data paths, and experiment parameters directly in the UI
-- **⛏️ Factor Mining**: Start experiments with natural language input and monitor progress in real-time
-- **📚 Factor Library**: Browse, search, and filter all discovered factors with quality classifications
-- **📈 Independent Backtest**: Select a factor library and run full-period backtests with visual results
 
 ---
 
-<a id="windows-deploy"></a>
-## 🪟 Windows Deployment
+## 四、启动方式
 
-QuantaAlpha is natively developed for Linux. Below is a guide to run it on **Windows 10/11**.
+需要**两个终端**，均从项目根或按下列路径操作。
 
-> For technical details, see [`docs/WINDOWS_COMPAT.md`](docs/WINDOWS_COMPAT.md).
-
-### Key Differences from Linux
-
-| Feature | Linux | Windows |
-| :--- | :--- | :--- |
-| Start mining | `./run.sh "direction"` | `python launcher.py mine --direction "direction"` |
-| Start frontend | `bash start.sh` | Start backend & frontend separately (see below) |
-| `.env` path format | `/home/user/data` | `C:/Users/user/data` (use forward slashes) |
-| Extra config | None | Must set `CONDA_DEFAULT_ENV` (see below) |
-| rdagent patches | None | Auto-applied (`quantaalpha/compat/rdagent_patches.py`) |
-
-### Installation
+**终端 1 — 后端（FastAPI，端口 8000）**
 
 ```powershell
-# 1. Install Miniconda (check "Add to PATH" during setup)
-# 2. Create conda environment
-conda create -n quantaalpha python=3.11 -y
-conda activate quantaalpha
-
-# 3. Clone and install
-git clone https://github.com/QuantaAlpha/QuantaAlpha.git
-cd QuantaAlpha
-set SETUPTOOLS_SCM_PRETEND_VERSION=0.1.0
-pip install -e .
+cd <解压路径>\QuantaAlpha-main
+uv run python frontend-v2\backend\app.py
 ```
 
-### Configure `.env`
+**终端 2 — 前端（Vite，端口 3000）**
 
 ```powershell
-copy configs\.env.example .env
+cd <解压路径>\QuantaAlpha-main\frontend-v2
+npm run dev
 ```
 
-Edit `.env` — use **forward slashes** for paths:
+浏览器打开：**[http://localhost:3000](http://localhost:3000)**
 
-```bash
-QLIB_DATA_DIR=C:/Users/yourname/path/to/cn_data
-DATA_RESULTS_DIR=C:/Users/yourname/path/to/results
-CONDA_ENV_NAME=quantaalpha
-CONDA_DEFAULT_ENV=quantaalpha    # ← Required on Windows
+- **今冬明春预测** — 燃气销量对话式智能体
+- **天气预测** — ECMWF 季节气温查看（需 `data/weather/` 下有 CSV）
+
+---
+
+## 五、今冬明春预测 · 使用流程
+
+1. 在输入框描述需求，例如：`预测2026年4月江苏天然气销量`
+2. 系统解析参数并展示卡片 → 回复 **「继续」** 或说明要改的省份/月份
+3. 展示特征重要性、LLM 推荐特征 → 再次确认
+4. 自动多模型比选（**耗时较长**，请耐心等待进度条）
+5. 结果卡片包含：
+  - **结果存入路径**（如 `forecast_agent_output/江苏/agent_flow_时间戳/`）
+  - 模型榜单、月度汇总表
+  - **预测值 vs 真实值** 折线图
+6. 任务完成后可继续追问，或点 **「新预测」** 开始下一轮
+
+**说明**：对话里写的省份决定读哪省 Excel、结果写入哪省目录；高级设置里的「兜底省份」仅在对话未提到省份时生效。
+
+---
+
+## 六、天气预测 · 使用流程
+
+1. 确认 `data/weather/` 下已有 `*_preview.csv` 与/或 `hebei_ecmwf_s5_daily_temperature_*.csv`（与后端同一项目根目录）
+2. 启动前后端后，导航栏点击 **「天气预测」**
+3. **左栏（6 小时预览）**
+  - 选择 preview CSV 文件
+  - 选择北京日期、整点（0–23 时）
+  - 查看该时刻 `temp_mean_c`（集合平均）及 P10/P50/P90 分位气温（℃）
+4. **右栏（日度）**
+  - 选择 daily CSV 文件
+  - 选择日期，查看当日 `temp_mean_c` 与各分位数
+
+气温数据含义（简要）：
+
+
+| 指标            | 含义               |
+| ------------- | ---------------- |
+| `temp_mean_c` | 51 个集合成员的平均预报气温  |
+| `temp_p10_c`  | 偏冷情景（约 10% 成员更低） |
+| `temp_p50_c`  | 中位数情景            |
+| `temp_p90_c`  | 偏暖情景（约 90% 成员更低） |
+
+
+**更新数据（可选）**：在项目根执行 `uv sync --extra weather`，配置 `.env` 中 `CDSAPI_*`，再运行 `scripts/weather/download_s5_hebei.py` → `preview_nc.py` / `extract_daily_temperature.py` 生成新 CSV。
+
+---
+
+## 七、燃气预测 · 输出文件位置
+
+默认结构：
+
+```text
+forecast_agent_output/
+  {省份}/
+    agent_flow_YYYYMMDD_HHMMSS/    ← 每次 Web 智能体任务一个子目录
+      xgboost/
+      lasso/
+      ...
+      agent_flow_result.json       ← 本轮完整结果摘要
+      model_selection_summary.json
 ```
 
-### Run
+各模型子目录含：`*_test.xlsx`、`*_forecast_plot.png`、`*_best_summary.json` 等。
+
+---
+
+## 八、命令行方式（可选，燃气）
+
+不启动网页时，可在项目根目录：
 
 ```powershell
-# Factor mining
-python launcher.py mine --direction "price-volume factor mining"
-
-# Standalone backtest
-python -m quantaalpha.backtest.run_backtest -c configs/backtest.yaml --factor-source custom --factor-json data/factorlib/all_factors_library.json -v
+uv run quantaalpha forecast --province 江苏 --model auto `
+  --as-of-month 2025-06-21 --test-start 2025-11-01 --test-end 2026-03-21 `
+  --output-dir forecast_agent_output/江苏
 ```
 
-### Web Frontend (Optional)
-
-Requires Node.js (v18+). Start in two terminals:
-
-```powershell
-# Terminal 1 — Backend API
-cd frontend-v2 && python backend/app.py
-
-# Terminal 2 — Frontend
-cd frontend-v2 && npm install && npm run dev
-```
-
-Visit http://localhost:3000.
-
-### Troubleshooting
-
-| Error | Fix |
-| :--- | :--- |
-| `CondaConf conda_env_name: Input should be a valid string` | Add `CONDA_DEFAULT_ENV=quantaalpha` to `.env` |
-| `UnicodeEncodeError: 'gbk'` | Run `chcp 65001` or set `PYTHONIOENCODING=utf-8` |
-| `Failed to resolve import "@radix-ui/react-hover-card"` | `cd frontend-v2 && npm install` |
+更多参数见 `configs/forecast.yaml`。
 
 ---
 
-## 💬 User Community
+## 九、常见问题
 
-<div align="center">
 
-| WeChat Group |
-| :---: |
-| <img src="docs/images/WeChat.jpg" width="250" alt="WeChat Group" /> |
+| 现象                  | 处理                                                                               |
+| ------------------- | -------------------------------------------------------------------------------- |
+| 页面提示后端不可用           | 确认终端 1 已启动，`http://localhost:8000/api/health` 可访问                                |
+| 缺少 OPENAI_API_KEY   | 检查项目根 `.env` 是否配置正确                                                              |
+| 未找到 processed 文件    | 确认 `data/processed_data/{省份}.xlsx` 存在，或检查 `FORECAST_DATA_DIR`                    |
+| 说了江苏但结果在河北目录        | 使用较新版本；确认后应用 `intent` 中的省份建目录，需重启后端                                              |
+| 多模型比选很慢             | 正常现象；`auto` 会依次跑多个模型（含 LSTM）                                                     |
+| 缺 torch / xgboost 等 | 执行 `uv sync --extra forecast`，并用 `uv run` 启动后端                                   |
+| 天气预测页无文件可选          | 确认 `data/weather/` 下有 `*_preview.csv` 或 `hebei_ecmwf_s5_daily_temperature_*.csv` |
+| CDS 下载失败            | 检查 `.env` 中 `CDSAPI_KEY`、数据集条款是否已在 Copernicus 网页接受；参考 `scripts/weather/` 与 `.env.example` |
 
-</div>
-
----
-
-## 🤝 Contributing
-
-We welcome all forms of contributions to make QuantaAlpha better! Here's how you can get involved:
-
-- **🐛 Bug Reports**: Found a bug? [Open an issue](https://github.com/QuantaAlpha/QuantaAlpha/issues) to help us fix it.
-- **💡 Feature Requests**: Have a great idea? [Start a discussion](https://github.com/QuantaAlpha/QuantaAlpha/discussions) to suggest new features.
-- **📝 Docs & Tutorials**: Improve documentation, add usage examples, or write tutorials.
-- **🔧 Code Contributions**: Submit PRs for bug fixes, performance improvements, or new functionality.
-- **🧬 New Factors**: Share high-quality factors discovered in your own runs to benefit the community.
 
 ---
 
-## 🙏 Acknowledgments
+## 十、目录与文档索引
 
-Special thanks to:
-- [Qlib](https://github.com/microsoft/qlib) - Quantitative investment platform by Microsoft
-- [RD-Agent](https://github.com/microsoft/RD-Agent) - An automated R&D framework by Microsoft (NeurIPS 2025)
-- [AlphaAgent](https://github.com/RndmVariableQ/AlphaAgent) - Multi-agent alpha factor mining framework (KDD 2025)
 
----
+| 路径                                                | 说明                     |
+| ------------------------------------------------- | ---------------------- |
+| `frontend-v2/src/pages/ForecastPage.tsx` | 今冬明春预测对话页 |
+| `frontend-v2/src/pages/WeatherForecastPage.tsx`   | 天气预测页                  |
+| `frontend-v2/backend/app.py`                      | Web 后端（燃气智能体 + 天气 API） |
+| `quantaalpha/forecast_agent/gas_forecast_flow.py` | 燃气编排与 LLM 提示词          |
+| `scripts/weather/`                                | CDS 下载与 CSV 导出脚本       |
+| `data/weather/`                                   | 气温 CSV 存放目录            |
+| `configs/forecast.yaml`                           | CLI 燃气预测默认配置           |
+| `.env.example`（项目根目录）                             | 环境变量模板                 |
+| `data/processed_data/README.md`                   | 省级燃气 Excel 说明（若有）          |
+| `docs/第三版修改方案.md`                                 | 对话式智能体设计说明             |
+| `docs/第四版修改方案.md`                                 | Agent 运行时改造说明             |
 
-## 🌐 About QuantaAlpha
-- QuantaAlpha was founded in **April 2025** by a team of professors, postdocs, PhDs, and master's students from **Tsinghua University, Peking University, CAS, CMU, HKUST**, and more.  
 
-🌟 Our mission is to explore the **"quantum"** of intelligence and pioneer the **"alpha"** frontier of agent research — from **CodeAgents** to **self-evolving intelligence**, and further to **financial and cross-domain specialized agents**, we are committed to redefining the boundaries of AI. 
-
-✨ In **2026**, we will continue to produce high-quality research in the following directions:  
-
-- **CodeAgent**: End-to-end autonomous execution of real-world tasks  
-
-- **DeepResearch**: Deep reasoning and retrieval-augmented intelligence  
-
-- **Agentic Reasoning / Agentic RL**: Agent-based reasoning and reinforcement learning 
-
-- **Self-evolution and collaborative learning**: Evolution and coordination of multi-agent systems  
-
-📢 We welcome students and researchers interested in these directions to join us!  
-
-🔗 **Team Homepage**: [QuantaAlpha](https://quantaalpha.github.io/)
-
-📧 **Email**: quantaalpha.ai@gmail.com
-
-## 🌐 About AIFin Lab
-
-Initiated by Professor Liwen Zhang from Shanghai University of Finance and Economics (SUFE), **AIFin Lab** is deeply rooted in the interdisciplinary fields of **AI + Finance, Statistics, and Data Science**. The team brings together cutting-edge scholars from top institutions such as SUFE, FDU, SEU, CMU, and CUHK. We are dedicated to building a comprehensive "full-link" system covering data, models, benchmarks, and intelligent prompting. 
-
-📢 We are actively looking for talented students (UG/Master/PhD) and researchers worldwide who are passionate about AI Agent security and financial intelligence to join **AIFin Lab**! 
-
-📧 **Email**: [aifinlab.sufe@gmail.com](mailto:aifinlab.sufe@gmail.com) (please CC to [zhang.liwen@shufe.edu.cn](mailto:zhang.liwen@shufe.edu.cn))
-
-We look forward to hearing from you!
-
----
-
-## 📖 Citation
-
-If you find QuantaAlpha useful in your research, please cite our work:
-
-```bibtex
-@misc{han2026quantaalphaevolutionaryframeworkllmdriven,
-      title={QuantaAlpha: An Evolutionary Framework for LLM-Driven Alpha Mining}, 
-      author={Jun Han and Shuo Zhang and Wei Li and Zhi Yang and Yifan Dong and Tu Hu and Jialuo Yuan and Xiaomin Yu and Yumo Zhu and Fangqi Lou and Xin Guo and Zhaowei Liu and Tianyi Jiang and Ruichuan An and Jingping Liu and Biao Wu and Rongze Chen and Kunyi Wang and Yifan Wang and Sen Hu and Xinbing Kong and Liwen Zhang and Ronghao Chen and Huacan Wang},
-      year={2026},
-      eprint={2602.07085},
-      archivePrefix={arXiv},
-      primaryClass={q-fin.ST},
-      url={https://arxiv.org/abs/2602.07085}, 
-}
-```
-
----
-
-## ⭐ Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=QuantaAlpha/QuantaAlpha&type=date&legend=top-left)](https://www.star-history.com/#QuantaAlpha/QuantaAlpha&type=date&legend=top-left)
-
----
-
-<div align="center">
-
-**⭐ If QuantaAlpha helps you, please give us a star!**
-
-Made with ❤️ by the QuantaAlpha Team
-
-</div>

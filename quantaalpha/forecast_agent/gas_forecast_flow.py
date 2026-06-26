@@ -29,12 +29,12 @@ from quantaalpha.forecast_agent.data import AS_OF_DATE
 from quantaalpha.forecast_agent.feature_registry import FEATURE_REGISTRY, feature_pool_for_prompt
 from quantaalpha.forecast_agent.feature_engineering import SARIMAX_EXOG_COLS
 from quantaalpha.forecast_agent.lstm_agent import SELECTED_FEATURES
+from quantaalpha.forecast_agent.llm.client_flow import create_chat_completion_with_retry
 from quantaalpha.forecast_agent.runner import (
     DEFAULT_CANDIDATE_MODELS,
     ForecastRunConfig,
     run_forecast,
 )
-from quantaalpha.llm.client import APIBackend
 from quantaalpha.log import logger
 
 DEFAULT_AGENT_CANDIDATE_MODELS = (
@@ -152,11 +152,12 @@ def _parse_intent_with_llm(query: str, *, default_province: str) -> dict[str, An
   "test_end": "2026-04-21"
 }}
 """
-    raw = APIBackend().build_messages_and_create_chat_completion(
+    raw = create_chat_completion_with_retry(
         user_prompt=user_prompt,
         system_prompt=system_prompt,
         json_mode=True,
         reasoning_flag=False,
+        scene="parse_intent",
     )
     payload = _extract_json_object(raw)
     return {
@@ -388,11 +389,12 @@ def recommend_feature_superset(
   "reason": "..."
 }}
 """
-    raw = APIBackend().build_messages_and_create_chat_completion(
+    raw = create_chat_completion_with_retry(
         user_prompt=user_prompt,
         system_prompt=system_prompt,
         json_mode=True,
         reasoning_flag=False,
+        scene="recommend_feature_superset",
     )
     payload = _extract_json_object(raw)
     picked = [str(x) for x in (payload.get("feature_set") or []) if str(x) in FEATURE_REGISTRY]
@@ -597,11 +599,12 @@ def _parse_continue_message_with_llm(
 请输出：{{"approved": true/false, "overrides": {{}}}}
 """
 
-    raw = APIBackend().build_messages_and_create_chat_completion(
+    raw = create_chat_completion_with_retry(
         user_prompt=user_prompt,
         system_prompt=system_prompt,
         json_mode=True,
         reasoning_flag=False,
+        scene=f"parse_continue_message:{checkpoint}",
     )
     parsed = _extract_json_object(raw)
     approved = bool(parsed.get("approved", True))
@@ -645,6 +648,8 @@ def parse_continue_message(
     overrides = normalize_continue_overrides(checkpoint, req_overrides or {})
 
     text = str(user_message or "").strip()
+    if not text and not overrides:
+        raise ValueError("继续确认内容不能为空，请回复“继续”或明确说明修改项。")
     if not text:
         return {"approved": approved, "overrides": overrides}
 
